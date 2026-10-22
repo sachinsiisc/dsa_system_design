@@ -19,38 +19,115 @@
 
 ```
 FUNCTIONAL REQUIREMENTS:
-  1. Merchant integrates our gateway (API key based)
-  2. Customer initiates payment on merchant's site
-  3. We collect payment method (card, UPI, wallet)
-  4. We route to the appropriate bank / payment processor
-  5. Bank approves or declines
-  6. We notify merchant of success/failure (webhook)
-  7. Merchant refunds (partial or full)
-  8. Merchant sees transaction history and settlements
-  9. We handle retries (if bank times out)
-  10. Fraud detection (flag suspicious transactions)
+  1.  Merchant onboards: registers via dashboard, gets API key pair (live + test mode).
+  2.  Merchant creates a PaymentOrder server-to-server (amount, currency, customer info).
+  3.  Customer is redirected to our hosted checkout page OR merchant uses our JS SDK.
+  4.  Customer selects payment method: card, UPI, net banking, wallet, BNPL.
+  5.  We collect, tokenize, and route payment data to the correct bank network.
+  6.  Bank / payment network responds: approved / declined / requires 3DS challenge.
+  7.  3D Secure (3DS): We redirect customer to bank's OTP page; await callback.
+  8.  We atomically update PaymentOrder status; update internal ledger.
+  9.  We deliver a signed webhook to merchant's server (with retry on failure).
+  10. Merchant can issue full or partial refunds against completed payments.
+  11. Settlement: every business day we net-settle all completed payments to merchants
+      after deducting our fee (e.g., 2% for cards) and any refunds/chargebacks.
+  12. Merchant dashboard: payment history, settlement reports, dispute management.
+  13. Fraud detection runs synchronously before routing; high-risk payments are flagged
+      for manual review or auto-blocked.
+  14. Dispute / Chargeback management: customer disputes with bank → we notify merchant
+      → merchant provides evidence → bank decides.
 
-KEY ENTITIES:
-  Merchant          — business using our payment gateway (Amazon, Flipkart)
-  Customer          — end user paying for something
-  PaymentOrder      — created BEFORE payment (amount, currency, merchant)
-  Payment           — the actual payment attempt (order + payment method + result)
-  PaymentMethod     — card / UPI / wallet / net banking
-  Card              — credit or debit card details (PAN, expiry, CVV)
-  UPIPayment        — UPI ID or QR code payment
-  Transaction       — final ledger entry after payment
-  Refund            — partial or full reversal of a transaction
-  PaymentProcessor  — routes to appropriate bank (Visa/Mastercard/NPCI)
-  FraudDetector     — flags suspicious transactions
-  WebhookService    — notifies merchant of payment events
-  Settlement        — batch transfer of funds to merchant account
+WHAT IS EXPLICITLY OUT OF SCOPE (say this in the interview):
+  - Issuing our own cards or bank accounts
+  - International multi-currency FX conversion (can mention as extension)
+  - Tax computation (merchant's responsibility)
+  - Full KYC pipeline (mention it exists but don't design it)
 
-NON-FUNCTIONAL:
-  99.99% uptime (4 nines = 52 min downtime/year)
-  < 3 second payment confirmation
-  PCI-DSS compliant (card data handling standards)
-  Idempotent APIs (retry safe — double-click shouldn't charge twice)
+KEY ENTITIES — and WHY each exists:
+  Merchant          — The business integrating us. Owns API keys, webhook URL, settlement
+                      account. Without a Merchant entity we can't route webhooks or settle funds.
+  Customer          — End user. We store only email/phone for receipts, never card data.
+  PaymentOrder      — Created by merchant BEFORE the customer pays. Captures merchant's
+                      intent: "I want ₹999 for order #XYZ." WHY separate from Payment?
+                      One Order can have multiple Payment ATTEMPTS (retry after failure).
+                      Order status = "did merchant get paid?"; Payment = each attempt.
+  Payment           — One attempt to fulfill an Order. Has its own state machine.
+                      Tracks which method was used, bank reference, failure reason.
+  PaymentMethod     — Abstract: Card, UPI, Wallet, NetBanking. Polymorphism here is key —
+                      CardProcessor and UPIProcessor can swap without touching gateway logic.
+  Card              — Stores ONLY pan_last4 + pan_hash + token. NEVER full PAN (PCI-DSS).
+                      CVV is NEVER stored, not even encrypted — industry rule.
+  UPIPayment        — VPA-based. UPI is asynchronous (customer approves in their app),
+                      unlike cards which are synchronous.
+  Transaction       — The double-entry ledger entry AFTER payment succeeds.
+                      Debit customer account, Credit merchant escrow. Finance/audit trail.
+  Refund            — Reversal. Must track each refund independently so partial refunds work.
+                      Total refunded ≤ original amount (enforced in code).
+  PaymentProcessor  — Strategy interface. CardProcessor → Visa/MC network. UPIProcessor →
+                      NPCI. WalletProcessor → Paytm/PhonePe APIs. Swappable.
+  FraudDetector     — Runs velocity checks, ML risk scoring, device fingerprinting.
+                      Returns risk_score: 0 (safe) → 1.0 (certain fraud). Blocks if > 0.8.
+  WebhookService    — Observer. When Payment status changes → HTTP POST to merchant.
+                      HMAC-signed payload. Retries with exponential backoff (5 attempts).
+  Settlement        — Batch nightly job. Aggregates COMPLETED payments per merchant,
+                      deducts fees and refunds, initiates NEFT/RTGS transfer.
+  IdempotencyStore  — Maps idempotency_key → payment_id. Prevents double-charge on retry.
+                      Lives in Redis (TTL 24h) + Postgres (permanent, for audit).
+
+NON-FUNCTIONAL REQUIREMENTS (with numbers — always say these in MAANG interviews):
+
+  AVAILABILITY:
+    99.99% uptime = ≤ 52 min downtime/year.
+    Achieved via: multi-AZ deployment, active-active replicas, circuit breakers.
+    Payment API is MORE critical than most services — a 5-minute outage = ₹crores lost.
+
+  LATENCY (P99 targets):
+    Order creation API:      < 200ms P99
+    Payment processing:      < 3s P99 (includes bank round-trip, avg ~1.5s)
+    Webhook delivery:        < 5s from payment completion
+    Dashboard queries:       < 500ms P99 (read replicas)
+    Fraud detection:         < 100ms (must be sync, within payment flow)
+
+  THROUGHPUT (capacity estimation):
+    Razorpay processes ~5 million transactions/day.
+    Peak: 10× average → 500 TPS (transactions per second) at peak.
+    Each payment: ~5 DB writes (order, payment, transaction, audit_log, webhook_log).
+    DB write IOPS: 500 × 5 = 2,500 writes/sec at peak.
+    Card tokenization calls to Visa/MC: 500/sec.
+    Webhook deliveries: 500/sec (1 webhook per payment).
+
+  STORAGE:
+    Each payment record: ~2 KB (all fields + audit).
+    5M payments/day × 365 days × 2 KB = ~3.5 TB/year.
+    With 5-year retention: ~17.5 TB for payment data alone.
+    Use: PostgreSQL primary + S3 for archival (cold data after 90 days).
+
+  CONSISTENCY:
+    STRONG consistency required for payment state changes.
+    "Did the customer get charged?" must have ONE answer across all servers.
+    Use: Postgres with SERIALIZABLE isolation for balance/ledger operations.
+    Use: Redis atomic operations (SETNX) for idempotency key locks.
+    Eventual consistency is OK for: analytics, reporting, dashboard counts.
+
+  SECURITY:
+    PCI-DSS Level 1 (highest tier — required for gateways processing > 6M cards/year).
+    TLS 1.2+ for all API calls. TLS 1.3 preferred.
+    All card data encrypted at rest (AES-256). Tokens stored, not PANs.
+    Webhook payloads signed with HMAC-SHA256. Merchant must verify before trusting.
+    API keys hashed with SHA-256. Constant-time comparison to prevent timing attacks.
+    Rate limiting: 100 API calls/second per merchant (prevents DDoS, brute force).
+
+  IDEMPOTENCY:
+    Every state-changing API must be idempotent.
+    Merchant provides idempotency_key (UUID or their order_id).
+    Same key → same response, no new charge. Critical for retry-on-timeout safety.
 ```
+
+**WHY THIS LEVEL OF DETAIL MATTERS IN INTERVIEWS:**
+- MAANG interviewers expect you to quantify: "5M txns/day → 500 TPS peak → 2,500 DB IOPS."
+- Saying "we need high availability" without a number is a red flag.
+- Saying "99.99% → 52 min/year" shows you've thought about real operational SLAs.
+- Latency targets drive architecture: < 100ms fraud check → must be in-process or Redis, not a DB query.
 
 ---
 
@@ -1555,4 +1632,339 @@ A:
     - Create bank transfer (NEFT/RTGS/IMPS to merchant's account)
     - Create Settlement record
     - Send settlement report to merchant
+```
+
+
+---
+
+## STEP 8 — Deep-Dive: 3D Secure and Bank Authorization Flow
+
+```
+WHY 3D SECURE (3DS) EXISTS:
+  Card-Not-Present (CNP) fraud: thief has stolen card number + CVV.
+  Without 3DS: thief shops online, enters card details → payment goes through.
+  With 3DS: bank sends OTP to cardholder's registered phone.
+  Thief has the card but not the phone → transaction blocked. ✓
+
+3DS 1.0 vs 3DS 2.0:
+  3DS 1.0 (old): always redirects user to bank's authentication page.
+    Interrupt checkout flow. Jarring UX. High abandonment rate.
+  3DS 2.0 (new): risk-based authentication.
+    Bank evaluates: device fingerprint, IP, transaction history, shipping address.
+    Low risk: authenticate silently (frictionless flow). No OTP needed.
+    High risk: challenge customer (OTP on phone).
+    Result: 95% of transactions are frictionless. Only risky ones get OTP.
+
+3DS 2.0 TECHNICAL FLOW:
+
+  Step 1: Device fingerprinting (JavaScript on merchant's checkout page)
+    Our SDK: collect device data silently.
+    {
+        "screen_resolution": "1920x1080",
+        "timezone": "Asia/Kolkata",
+        "browser": "Chrome/118.0",
+        "plugins": ["PDF Viewer", ...],
+        "ip": "103.45.67.89",
+        "device_id": "fingerprint_hash_abc123"  // computed from above
+    }
+    POST to Visa/Mastercard Directory Server (DS): "Initiate 3DS for this card + device."
+    DS → forwards to card's issuing bank (HDFC, SBI, etc.).
+  
+  Step 2: Issuing bank evaluates (100-300ms, invisible to user)
+    Bank's Access Control Server (ACS) runs fraud model:
+    - Is this device seen before for this card? ✓
+    - Is IP in expected geography? ✓
+    - Transaction amount vs typical? ✓
+    - Time of day unusual? ✓
+    All low risk → frictionless: bank approves without OTP.
+    High risk → challenge: bank sends OTP to cardholder's phone.
+  
+  Step 3: Challenge (only if triggered)
+    Browser: redirect to bank's ACS page.
+    Customer: enters OTP from SMS.
+    ACS: verifies OTP → returns authentication result.
+  
+  Step 4: Final authorization
+    Authentication result (CAVV — Cardholder Authentication Verification Value):
+      A cryptographic proof that cardholder was authenticated.
+    Payment request → bank's authorization server includes CAVV.
+    Bank: verify CAVV → approve transaction.
+    
+    Liability shift: if 3DS authentication used:
+      - Fraud occurs → LIABILITY IS BANK'S, not merchant's.
+      - Without 3DS: fraud → merchant pays chargeback.
+      - This is why merchants prefer 3DS despite friction.
+
+LLD IMPLEMENTATION — 3DS Flow in PaymentProcessor:
+
+  class ThreeDSProcessor:
+      """Handles 3D Secure authentication."""
+      
+      def initiate(self, payment: Payment, device_data: dict) -> ThreeDSSession:
+          """Step 1: Start 3DS authentication flow."""
+          session_id = str(uuid.uuid4())
+          
+          # In production: POST to Visa/Mastercard DS API
+          ds_response = self._directory_server.initiate_authentication({
+              "card_number": payment.method.pan_hash,
+              "amount": str(payment.amount),
+              "currency": payment.order.currency,
+              "device_data": device_data,
+              "merchant_id": payment.order.merchant.id,
+          })
+          
+          return ThreeDSSession(
+              session_id=session_id,
+              authentication_url=ds_response.get("acs_url"),
+              is_frictionless=ds_response.get("frictionless", False),
+              cavv=ds_response.get("cavv") if ds_response.get("frictionless") else None
+          )
+      
+      def complete(self, session: ThreeDSSession, otp: str = None) -> str:
+          """Step 3 (only if challenged): complete OTP verification."""
+          if session.is_frictionless:
+              return session.cavv  # Already have CAVV from frictionless flow
+          
+          # OTP verification with bank's ACS
+          acs_response = self._acs_client.submit_otp(session.session_id, otp)
+          if not acs_response.get("authenticated"):
+              raise AuthenticationError("3DS OTP verification failed")
+          return acs_response["cavv"]
+      
+  # Modified CardProcessor to include 3DS:
+  class CardProcessor3DS(CardProcessor):
+      def __init__(self, three_ds: ThreeDSProcessor):
+          super().__init__()
+          self._3ds = three_ds
+      
+      def _authorize(self, payment: Payment) -> PaymentResult:
+          # Step 1: 3DS authentication
+          device_data = payment.metadata.get("device_data", {})
+          session = self._3ds.initiate(payment, device_data)
+          
+          if not session.is_frictionless:
+              # Challenge required: return "needs_3ds" status
+              # Client handles OTP flow, then calls complete_payment(session_id, otp)
+              return PaymentResult(
+                  success=False, status=PaymentStatus.REQUIRES_ACTION,
+                  action={"type": "3ds_challenge", "url": session.authentication_url}
+              )
+          
+          # Frictionless: proceed with authorization including CAVV
+          cavv = session.cavv
+          return self._submit_to_bank(payment, cavv)
+```
+
+---
+
+## STEP 9 — Deep-Dive: Chargeback and Dispute Management
+
+```
+WHAT IS A CHARGEBACK?
+  Customer calls bank: "I never authorized this charge."
+  Bank: immediately reverses the payment, debits merchant's account.
+  Merchant: must PROVE the customer did authorize the payment.
+  
+  Timeline:
+    Day 0: Customer disputes.
+    Day 1: Bank reverses funds. Merchant debited.
+    Days 2-30: Merchant can provide evidence (invoice, delivery confirmation, 3DS proof).
+    Day 30-60: Bank arbitrates.
+    Day 45-90: Final ruling. Merchant wins (funds returned) or bank wins (funds stay reversed).
+  
+  Chargeback cost to merchant:
+    Reversed amount: ₹5,000.
+    Chargeback fee: ₹500-1,500 (charged by gateway even if merchant wins).
+    Ops cost: staff time to gather evidence.
+    Total: ₹6,000-8,000 loss per chargeback.
+  
+  CHARGEBACK RATE:
+    Visa threshold: 1% of transactions. Above → Visa issues "excessive chargeback" warning.
+    Above 2% for 2+ months: Visa can terminate the merchant's ability to accept Visa cards.
+    High-risk industries (gambling, digital goods): higher thresholds negotiated.
+
+LLD — CHARGEBACK ENTITY:
+
+  class ChargebackStatus(Enum):
+      RECEIVED         = "received"         # Bank initiated chargeback
+      EVIDENCE_NEEDED  = "evidence_needed"  # Merchant must submit evidence
+      EVIDENCE_SUBMITTED = "evidence_submitted"
+      WON              = "won"              # Merchant won dispute
+      LOST             = "lost"             # Merchant lost, funds stay reversed
+      ACCEPTED         = "accepted"         # Merchant accepted (didn't fight it)
+  
+  @dataclass
+  class ChargebackEvidence:
+      """Evidence merchant submits to fight a chargeback."""
+      delivery_proof: Optional[str]       # delivery confirmation URL/document
+      customer_communication: Optional[str]  # email thread showing customer authorized
+      three_ds_authentication: Optional[str]  # CAVV proving 3DS used
+      ip_address: Optional[str]           # IP used at time of transaction
+      device_fingerprint: Optional[str]   # device data proving same device
+      refund_issued: bool = False         # "we already refunded them" → auto-win
+  
+  class Chargeback:
+      def __init__(self, payment: Payment, reason: str, deadline: datetime):
+          self.id = str(uuid.uuid4())
+          self.payment = payment
+          self.reason = reason  # "fraud", "not_received", "not_as_described", "duplicate"
+          self.deadline = deadline  # last day to submit evidence
+          self.status = ChargebackStatus.RECEIVED
+          self.evidence: Optional[ChargebackEvidence] = None
+          self.opened_at = datetime.utcnow()
+          
+          # Immediately reverse payment funds
+          payment.transition_to(PaymentStatus.CHARGEBACKED)
+      
+      def submit_evidence(self, evidence: ChargebackEvidence) -> None:
+          if datetime.utcnow() > self.deadline:
+              raise ValueError("Chargeback evidence deadline has passed")
+          self.evidence = evidence
+          self.status = ChargebackStatus.EVIDENCE_SUBMITTED
+          # In production: POST to bank's dispute API with evidence documents
+      
+      def accept(self) -> None:
+          """Merchant accepts the chargeback (doesn't fight it)."""
+          self.status = ChargebackStatus.ACCEPTED
+          # When to accept? If amount is small (< ₹1,000), fighting costs more than winning.
+          # Or if merchant knows customer is correct (item was lost in shipping).
+  
+  class ChargebackService:
+      def __init__(self, payment_gateway: 'PaymentGatewayService'):
+          self._gateway = payment_gateway
+          self._chargebacks: Dict[str, Chargeback] = {}
+      
+      def receive_chargeback(self, payment_id: str, reason: str) -> Chargeback:
+          """Called by webhook from bank when chargeback is initiated."""
+          payment = self._gateway.get_payment(payment_id)
+          if not payment:
+              raise ValueError(f"Payment {payment_id} not found")
+          
+          deadline = datetime.utcnow() + timedelta(days=20)  # 20 days to respond
+          chargeback = Chargeback(payment, reason, deadline)
+          self._chargebacks[chargeback.id] = chargeback
+          
+          # Notify merchant via webhook
+          self._gateway._webhooks.send(
+              payment.order.merchant,
+              "chargeback.received",
+              payment
+          )
+          return chargeback
+      
+      def get_chargeback_rate(self, merchant_id: str, days: int = 30) -> float:
+          """Calculate merchant's chargeback rate (total CB / total transactions)."""
+          # In production: query DB for this merchant's transactions and chargebacks
+          # This rate determines risk level and fees charged to merchant
+          pass
+
+CHARGEBACK PREVENTION STRATEGIES (important for interviews):
+  
+  1. Use 3DS: provides "liability shift" → chargebacks go to bank, not merchant.
+  2. Clear billing descriptor: "AMAZON.IN PURCHASE" not "AMZN*456XY" (prevents confusion).
+  3. Easy refunds: if customer can self-serve refund → they won't call bank.
+  4. Delivery confirmation: signed proof that customer received goods.
+  5. Fraud detection: catch fraudulent transactions BEFORE they complete.
+  6. Customer communication: respond to complaints within 24 hours.
+  7. Chargeback pre-dispute alerts: Visa/Mastercard offer alert programs.
+     Merchant gets notified of IMMINENT chargeback.
+     Can pro-actively refund before chargeback is filed.
+     Saves chargeback fee ($25-50) + administrative burden.
+```
+
+---
+
+## STEP 10 — SOLID Principles + Design Pattern Review
+
+```
+EVERY PATTERN USED — WITH PAYMENT-SPECIFIC EXPLANATION:
+
+STRATEGY PATTERN (IPaymentProcessor):
+  Without Strategy: PaymentGatewayService has if/elif:
+    if method_type == "CARD":
+      # 100 lines of card processing
+    elif method_type == "UPI":
+      # 100 lines of UPI processing
+    elif method_type == "WALLET":
+      # 100 lines of wallet processing
+  
+  Problems: 400-line method, cannot test independently, adding PayPal means editing this class.
+  
+  With Strategy:
+    processor = processors[payment_method.type]  # dict lookup
+    result = processor.process(payment)            # one line
+    
+  Adding PayPal: create PayPalProcessor(IPaymentProcessor). Zero change to PaymentGatewayService.
+  Testing: unit test CardProcessor in isolation. Mock IPaymentProcessor in gateway tests.
+  Open/Closed: open for extension (new processor), closed for modification (gateway unchanged).
+
+TEMPLATE METHOD (IPaymentProcessor.process()):
+  All processors share the same FLOW: validate → authorize → capture.
+  But each step's IMPLEMENTATION differs per payment type.
+  
+  Template Method: define flow in base class. Subclasses override steps.
+  
+  class IPaymentProcessor(ABC):
+      def process(self, payment: Payment) -> PaymentResult:
+          self._validate(payment)     # subclass overrides
+          auth = self._authorize(payment)  # subclass overrides
+          if auth.success:
+              return self._capture(payment, auth)  # subclass overrides
+          return auth
+      
+      @abstractmethod
+      def _validate(self, payment): ...
+      @abstractmethod
+      def _authorize(self, payment): ...
+      @abstractmethod
+      def _capture(self, payment, auth): ...
+  
+  Template Method = "Hollywood Principle" (Don't call us, we'll call you):
+  Subclass doesn't call process(). Base class calls subclass's validate/authorize/capture.
+  Inversion of control at the method level.
+
+STATE MACHINE (Payment status transitions):
+  Payments: PENDING → PROCESSING → COMPLETED → REFUNDED → CHARGEBACKED.
+  Some transitions are illegal: COMPLETED → PROCESSING (can't un-complete).
+  
+  State Machine enforces legal transitions:
+    PENDING    → PROCESSING (payment.process())
+    PROCESSING → COMPLETED, FAILED (bank response)
+    COMPLETED  → REFUNDED (refund issued), CHARGEBACKED (bank reversal)
+    FAILED     → PENDING (retry allowed)
+    REFUNDED   → (terminal state)
+    CHARGEBACKED → (terminal state, unless merchant wins dispute → COMPLETED restored)
+  
+  Enforcement with AtomicReference.compareAndSet:
+    boolean transitionTo(PaymentStatus expected, PaymentStatus next) {
+        return status.compareAndSet(expected, next);
+    }
+    // Only succeeds if current state == expected.
+    // Prevents race condition: two threads trying to process same payment.
+    // Only ONE thread's compareAndSet(PENDING, PROCESSING) will succeed.
+
+OBSERVER (WebhookService):
+  Payment status changes → notify merchant immediately.
+  Webhook is the "notification" in the Observer pattern.
+  
+  Subject: PaymentGatewayService (generates events).
+  Observer: WebhookService (handles events).
+  
+  Registration: merchant provides webhook_url at registration.
+  Notification: PaymentGatewayService calls webhooks.send() after every status change.
+  
+  RETRY LOGIC for failed webhooks (production critical):
+    Merchant's server might be down. POST fails. Must retry.
+    Retry schedule: 1s, 5s, 30s, 5min, 30min, 2h, 8h, 24h (exponential backoff).
+    After 72 hours with no success: mark webhook as failed. Alert merchant.
+    
+    Implementation: Kafka-based retry.
+      On failure: publish to "webhook.retry" Kafka topic with next_attempt_at timestamp.
+      Retry worker: consumes "webhook.retry", checks if now >= next_attempt_at → retry.
+      If retry fails: re-publish with new next_attempt_at. Repeat until max retries.
+    
+    Idempotency for webhooks:
+      Each webhook has unique webhook_id.
+      Merchant's endpoint: check if webhook_id seen before → skip if duplicate.
+      Our webhook payload: includes "webhook_id": "wh_abc123" for deduplication.
 ```

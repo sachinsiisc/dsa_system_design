@@ -410,3 +410,412 @@ A: Same pre-signed S3 upload flow. Kafka event triggers Video Transcoding Worker
    Longer processing time: notify user when done.
    Video thumbnails: extract frame at 1s, use as cover image.
 ```
+
+
+---
+
+## STEP 10 — Deep-Dive: Notification System
+
+```
+EVENTS TRIGGERING NOTIFICATIONS:
+  Like on post    -> notify post author
+  Comment on post -> notify post author
+  Follow          -> notify followed user
+  @Mention        -> notify mentioned user
+  Story view      -> aggregate viewers list, not individual push
+
+ARCHITECTURE:
+  User action -> [API Service] -> write DB -> publish Kafka event
+  Kafka topic: "notification.events" (partitioned by recipient_user_id)
+  [Notification Worker] consumes:
+    1. Determine recipient
+    2. Check: muted? blocked? notifications disabled for this type?
+    3. Store in Cassandra notifications table
+    4. Push via APNs (iOS) or FCM (Android)
+
+NOTIFICATION BATCHING (avoiding spam):
+  100 likes in 2 hours: don't send 100 pushes.
+  Batch: "sachdev and 99 others liked your photo."
+  
+  Redis counter: "notif_batch:{post_id}:likes" with 15-min TTL.
+  First like: push immediately, set Redis counter = 1.
+  Subsequent likes: INCR counter, no push.
+  On TTL expiry: if count > 1, send "X others also liked."
+
+NOTIFICATION STORAGE (Cassandra):
+
+  CREATE TABLE notifications (
+      user_id     UUID,
+      notif_id    TIMEUUID,
+      type        TEXT,
+      actor_id    UUID,
+      post_id     UUID,
+      is_read     BOOLEAN DEFAULT FALSE,
+      PRIMARY KEY (user_id, notif_id)
+  ) WITH CLUSTERING ORDER BY (notif_id DESC)
+    AND default_time_to_live = 7776000;  -- 90-day TTL
+  
+  Partition = all notifications for one user on one node.
+  TIMEUUID = time-ordered (newest first for free, no secondary index).
+```
+
+---
+
+## STEP 11 — Deep-Dive: Like and Comment Counters
+
+```
+LIKE COUNTER PROBLEM:
+  25B likes/day = 289K likes/sec avg; peak 1.4M likes/sec.
+  Cannot write directly to DB at this rate.
+
+SOLUTION: Redis INCR + Async Flush
+
+  def like_post(post_id, user_id):
+      # Idempotent check
+      is_new = redis.sadd(f"liked_by:{post_id}", user_id)
+      if not is_new:
+          return  # already liked
+      
+      new_count = redis.incr(f"likes:{post_id}")
+      kafka.publish("notification.events", {"type": "LIKE", "actor_id": user_id, "post_id": post_id})
+      return {"likes": new_count}
+  
+  Async flush (every 30s):
+    for key in redis.scan_iter("likes:*"):
+        delta = redis.getdel(key)
+        db.execute("UPDATE posts SET like_count = like_count + ? WHERE post_id = ?", delta, post_id)
+  
+  "liked_by" SET only kept in Redis for posts active in last 48h.
+  Older posts: query Cassandra post_likes table:
+    CREATE TABLE post_likes (post_id UUID, user_id UUID, PRIMARY KEY (post_id, user_id));
+
+COMMENT STORAGE (Cassandra):
+  CREATE TABLE comments (
+      post_id    UUID,
+      comment_id TIMEUUID,
+      author_id  UUID,
+      content    VARCHAR(2200),
+      reply_to   UUID,
+      like_count INT DEFAULT 0,
+      PRIMARY KEY (post_id, comment_id)
+  ) WITH CLUSTERING ORDER BY (comment_id DESC);
+  
+  Cursor pagination: WHERE comment_id < {cursor} LIMIT 20 -- O(1) per page flip.
+```
+
+---
+
+## STEP 12 — Deep-Dive: Database Architecture
+
+```
+INSTAGRAM'S ACTUAL DATABASE STACK (2023):
+
+PostgreSQL (CitusDB sharding):
+  What: user accounts, follows, post metadata.
+  Shard key: user_id for user-centric queries; post_id for post-centric.
+  Scale: 10,000+ logical shards across ~100 physical DB clusters.
+  Why: Instagram built on Django/PostgreSQL. Scaled via sharding, not DB replacement.
+
+Cassandra:
+  What: comments (time-series), notifications, activity feeds.
+  Why: high write throughput, TTL support, natural time-ordered access pattern.
+
+Memcached:
+  What: DB query caching (pure read cache, no data structures).
+  Why: simpler and slightly faster than Redis for pure key-value caching.
+  mcrouter: Facebook-built Memcached proxy (consistent hashing, failover, replication).
+
+Redis Cluster:
+  What: pre-computed feeds (1000 post IDs per user), like/view counts,
+        trending hashtags, sessions, rate limiting.
+  Total: 4 TB+ across cluster.
+
+S3 + Facebook CDN:
+  What: all photo/video media.
+  Cache-Control: max-age=31536000 (1 year, immutable URLs).
+  CDN hit rate: >99% for popular content.
+
+DUAL-SHARDING STRATEGY:
+  posts_by_user (shard by user_id): for profile grid and user's history.
+  posts_by_id (shard by post_id): for direct post access and comments.
+  Writes: write to both shards (Saga pattern for consistency).
+  Reads: route to relevant shard based on query type.
+```
+
+---
+
+## STEP 13 — Deep-Dive: ML Feed Ranking
+
+```
+PROBLEM: User follows 1000 accounts. Opens Instagram after 8 hours.
+  ~8,000 available posts. Must surface the 20 most relevant.
+
+TWO-STAGE APPROACH:
+
+STAGE 1: CANDIDATE GENERATION (8,000 -> 1,500)
+  Pre-computed Redis feed (fan-out on write for regular users): ~800 posts.
+  Celebrity follows (fan-out on read): ~200 posts.
+  Reels/Explore recommendations: ~300 posts.
+  Followed hashtags recent posts: ~200 posts.
+  Total candidates: ~1,500.
+
+STAGE 2: ML RANKING (1,500 -> top 50 -> final 20)
+
+  KEY FEATURES:
+  
+  Post features:
+    age_hours: exponential decay for older posts.
+    engagement_velocity: likes per impression in first hour.
+    post_type: photo/reel/carousel (user-specific type preference).
+  
+  User-Author relationship (STRONGEST signals):
+    direct_interaction_score: how often user likes/comments author's posts.
+    profile_visit_recency: visited author's profile in last 7 days?
+    dm_history: ever sent a DM to this author? Very strong signal.
+  
+  User preference:
+    topic_affinity: food? fitness? travel? (derived from last 50 likes).
+    session_context: time of day + device type.
+
+  PREDICTED OUTPUTS:
+    P(like), P(comment), P(save) -- save weighted HIGHEST (strongest intent)
+    P(not_interested) -- penalized heavily
+
+  COMPOSITE SCORE:
+    score = 2.0*P(save) + 1.0*P(like) + 1.5*P(comment) - 3.0*P(not_interested)
+    
+    Weights tuned via A/B testing to maximize long-term retention.
+
+  FINAL ASSEMBLY:
+    1500 scored -> top 50 selected.
+    Dedup: max 2 consecutive posts from same author.
+    Diversity: inject 1 "Discovery" post (non-followed account) every 7 posts.
+    Return top 20 to client.
+
+RETRAINING:
+  Weekly retraining on 100M+ interaction events/day.
+  PyTorch on Meta's ML cluster. Served via Triton Inference Server.
+  Inference: <10ms for 1500 candidates.
+```
+
+
+---
+
+## DEEP-DIVE IMPROVEMENT: Photo Upload Pipeline — Every Step Explained
+
+```
+FIVE STAGES OF A PHOTO UPLOAD (end-to-end):
+
+STAGE 1: CLIENT-SIDE PREPROCESSING (on user's device before any network call)
+  
+  a) Compression:
+     Original: iPhone 14 photo = 8MB RAW.
+     Instagram client: detect format (HEIC/JPG/PNG) → convert to JPEG.
+     Resize to max 1080×1080 (Instagram's max display resolution).
+     JPEG quality = 85% (visually lossless, reduces to ~200-500KB).
+     Why client-side? Saves bandwidth. 8MB → 300KB = 96% less data uploaded.
+  
+  b) Metadata stripping:
+     EXIF data: contains GPS coordinates, camera serial number, timestamp.
+     Privacy: Instagram strips GPS coordinates from EXIF (user option).
+     Kept: camera model, orientation (for correct display rotation).
+  
+  c) Blurhash generation:
+     Before upload: compute Blurhash of photo (20-byte string representing colors).
+     "iVBO=.xZ3c01..." = placeholder shown while full photo loads.
+     Sent inline in the post creation request (no separate upload).
+     Why: allows server to show colored placeholder immediately — much better UX than grey box.
+
+STAGE 2: PRE-SIGNED URL ACQUISITION
+  
+  Client → POST /api/media/initiate
+  Request: {filename: "photo.jpg", filesize: 312000, mime_type: "image/jpeg"}
+  
+  Server (Upload Service):
+    1. Validate: filesize < 10MB, mime_type allowed, user within storage quota.
+    2. Generate S3 pre-signed URL:
+       s3.generate_presigned_url(
+           "put_object",
+           Params={
+               "Bucket": "instagram-uploads-raw",
+               "Key": f"raw/{user_id}/{upload_id}/original.jpg",
+               "ContentType": "image/jpeg",
+               "ContentLength": 312000,
+               "ServerSideEncryption": "AES256",  # encrypted at rest
+           },
+           ExpiresIn=3600  # URL valid for 1 hour
+       )
+    3. Store upload session in Redis: "upload:{upload_id}" → {user_id, status: "pending", expiry: ...}
+    4. Return: {upload_id: "...", presigned_url: "https://instagram-uploads-raw.s3.amazonaws.com/..."}
+  
+  Why pre-signed URL instead of uploading through Instagram's server?
+    Without: Client → Instagram Server → S3. Instagram server handles upload bandwidth.
+    With: Client → S3 directly. Instagram Server handles only tiny JSON request.
+    Instagram's servers: zero video/photo bandwidth. They scale for API calls, not file transfers.
+
+STAGE 3: DIRECT UPLOAD TO S3
+  
+  Client: PUT {presigned_url} with photo bytes in body.
+  S3 receives file. Verifies ContentLength matches. Stores in raw bucket.
+  S3 emits event: S3:ObjectCreated to EventBridge / SNS.
+  
+  Multipart upload (for files > 5MB):
+    Split into 5MB chunks. Upload each chunk independently.
+    S3 assembles on finalize.
+    If one chunk fails: retry only that chunk.
+    Client: show upload progress bar (chunk_received / total_chunks).
+  
+  For Instagram photos (< 5MB after compression): single PUT. No multipart needed.
+  For Instagram videos (up to 1GB): multipart critical.
+
+STAGE 4: PROCESSING PIPELINE (async, post-upload)
+  
+  Trigger: S3 ObjectCreated event → Kafka "media.uploaded" topic.
+  
+  Multiple consumers in parallel:
+  
+  a) Image Processing Worker (most critical):
+     Read raw JPEG from S3.
+     Generate multiple sizes:
+       Thumbnail:   150×150 (profile grid, search results)
+       Square:      640×640 (main feed on mobile)
+       Standard:    1080×1080 (full resolution display)
+       High-DPI:    1440×1440 (retina displays)
+     Apply: sharpening filter, color normalization.
+     Encode all as JPEG (quality 90%) and WebP (30% smaller, for modern browsers).
+     Upload all 8 variants to CDN bucket: cdn.instagram.com/media/{post_id}/...
+     Publish: "media.processed" Kafka event.
+  
+  b) Content Safety Worker:
+     PhotoDNA: perceptual hash → compare against CSAM database (required by law).
+     NSFW classifier: ML model → score 0.0 to 1.0 (nudity/violence probability).
+     Score > 0.9: automatically block post. Score 0.7-0.9: flag for human review.
+     If blocked: publish "media.blocked" → post status = REJECTED.
+  
+  c) Machine Learning Worker:
+     Object detection: what's in the photo? (food, face, nature, product, etc.)
+     Face detection: how many faces? (used for suggesting tags/mentions)
+     Alt-text generation: auto-generate accessibility text ("Two people at sunset beach").
+     Landmark detection: recognize famous places → suggest location tag.
+     These ML results stored in post metadata → used for recommendations + search.
+  
+  d) Thumbnail Extraction (videos only):
+     Extract frame at t=1s → use as video cover thumbnail.
+     Multiple candidate frames: user can pick which one.
+
+STAGE 5: POST CREATION (after processing completes)
+  
+  "media.processed" event consumed by Post Service.
+  Post status: PENDING → PUBLISHED.
+  CDN URLs stored in posts table.
+  Fan-out to followers' feeds (Kafka "post.published" event).
+  Notification: "media.processed" → notify creator ("Your photo is ready!").
+  
+  Total time from upload complete to visible in feed: ~5-15 seconds.
+  Why not instant? Distributed processing takes time.
+  Instagram shows "Processing..." spinner during this window.
+  
+  Optimization for simple photos (no processing needed):
+    For photos that pass initial safety check instantly:
+    Show post in creator's own feed immediately ("optimistic publishing").
+    Processing continues in background.
+    If processing rejects it: pull from feed + notify user. Rare (< 0.01%).
+```
+
+---
+
+## DEEP-DIVE IMPROVEMENT: Story Architecture (24-Hour Ephemerality)
+
+```
+STORIES ARE ARCHITECTURALLY DIFFERENT FROM POSTS:
+  Posts: permanent (unless deleted), stored in postgres, indexed.
+  Stories: ephemeral (24h TTL), ordered ring by user, viewer tracking.
+
+KEY DIFFERENCES:
+  1. TTL (Time to Live): stories auto-expire after 24 hours.
+  2. View tracking: who viewed your story (unlike posts which only count views).
+  3. Ring ordering: stories shown in a ring (left to right chronologically).
+  4. Disappearing: 24h after posting, story disappears completely.
+
+STORY DATA MODEL:
+
+  CREATE TABLE stories (
+      story_id       CHAR(11) PRIMARY KEY,           -- ULID for time-ordering
+      author_id      UUID NOT NULL,
+      media_url      TEXT NOT NULL,                   -- CDN URL
+      media_type     TEXT NOT NULL,                   -- 'image' or 'video'
+      duration_ms    INT DEFAULT 5000,                -- how long to show (5s default)
+      thumbnail_url  TEXT,                            -- video thumbnail
+      created_at     TIMESTAMP DEFAULT NOW(),
+      expires_at     TIMESTAMP,                       -- created_at + 24 hours
+      text_overlay   JSONB,                           -- stickers, text, drawings
+      music_track_id UUID                             -- optional background music
+  );
+  CREATE INDEX idx_story_author ON stories(author_id, expires_at DESC);
+  
+  Stories TTL enforcement:
+    PostgreSQL: expires_at column. Query: WHERE expires_at > NOW() (only active stories).
+    Background job: DELETE FROM stories WHERE expires_at < NOW() - INTERVAL '1 hour'.
+      Run hourly. Cleanup stories 1 hour past expiry (give CDN time to stop serving).
+    CDN: story media has Cache-Control: max-age=86400 (24h). After 24h, CDN auto-expires.
+    Why not Redis TTL? Stories table is in PostgreSQL (relational, for complex queries).
+      Redis TTL only works for Redis keys, not PostgreSQL rows.
+
+VIEW TRACKING — WHO SAW YOUR STORY:
+
+  CREATE TABLE story_views (
+      story_id   CHAR(11),
+      viewer_id  UUID,
+      viewed_at  TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (story_id, viewer_id)  -- composite PK prevents duplicate views
+  );
+  
+  INSERT INTO story_views (story_id, viewer_id)
+  VALUES (?, ?)
+  ON CONFLICT (story_id, viewer_id) DO NOTHING;  -- idempotent: view twice = counted once
+  
+  Query "who viewed my story":
+    SELECT viewer_id, viewed_at FROM story_views WHERE story_id = ?
+    ORDER BY viewed_at DESC;
+  
+  This table is HUGE:
+    1B users × 5 stories/day × avg 100 viewers = 500B rows/day.
+    After 24h: these rows become useless (story expired).
+    
+    TTL strategy:
+    Option A: Delete rows when story expires (cascade delete).
+      DELETE FROM story_views WHERE story_id IN (SELECT story_id FROM stories WHERE expires_at < NOW()).
+      Runs with the story cleanup job.
+    
+    Option B: Cassandra for story_views (better at TTL + high write volume).
+      CREATE TABLE story_views (...) WITH default_time_to_live = 86400;
+      Cassandra auto-purges rows after 24h. Zero maintenance needed.
+      WINNER: Instagram uses Cassandra for story views.
+
+STORY RING (the horizontal scroll of avatars):
+  When you open Instagram: see a row of circles at top = who has stories.
+  
+  HOW IT'S BUILT:
+    Redis Sorted Set per user: "story_ring:{user_id}"
+    Score = latest_story_timestamp for each followed user who has an active story.
+    Member = followed_user_id.
+    
+    When @bob posts a story:
+      For each of Bob's followers: ZADD "story_ring:{follower_id}" {now} "bob_id"
+    
+    When Bob's story expires:
+      ZREM "story_ring:{follower_id}" "bob_id" (fan-out to all followers)
+      OR: just let Redis TTL handle it (if we set TTL on the score/member? Not possible with ZSET)
+      Better: lazy removal: when building ring, filter out users with no active stories.
+    
+    Get story ring for Alice:
+      ZRANGE "story_ring:{alice_id}" -1 0 REV WITHSCORES
+      → Returns Bob, Carol, etc. sorted by most recent story first.
+    
+    Red dot (unviewed vs viewed):
+      Unviewed: red/colored ring around avatar.
+      Viewed: grey ring.
+      Stored: Redis SET "stories_viewed:{alice_id}:{date}" → set of story_ids Alice viewed today.
+      For each story in ring: check if any unviewed stories exist from that user.
+      Result: show colored ring if user has unviewed stories; grey otherwise.
+```

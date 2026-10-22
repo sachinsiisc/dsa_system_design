@@ -1708,3 +1708,232 @@ Q: "Why return HTTP 410 vs 404?"
 - **404 Not Found:** This URL *never* existed. The client shouldn't cache this.
 - **410 Gone:** This URL *did* exist but was permanently removed. The client/CDN CAN cache this (no point trying again). Bots and crawlers stop indexing the link.
 - For our URL shortener: a user-deleted URL returns 410. A code that was never created returns 404. Different semantics, different behavior for callers.
+
+
+---
+
+## STEP 8 — Extended Deep-Dives: Production Patterns
+
+```
+DESIGN PATTERN DEEP-DIVE: DECORATOR PATTERN FOR ANALYTICS
+
+  Instead of modifying RedirectService, WRAP it with analytics tracking.
+  Open/Closed Principle: open for extension (wrap), closed for modification.
+
+  class AnalyticsRedirectService:
+      """
+      DECORATOR: Wraps any IRedirectService with click analytics.
+      The wrapped service does not know it is being decorated.
+      """
+      def __init__(self, inner: RedirectService, kafka_producer):
+          self._inner = inner
+          self._kafka = kafka_producer
+      
+      def resolve(self, short_code: str, request_context: dict) -> tuple:
+          # 1. Call inner service (unchanged behavior)
+          status, url = self._inner.resolve(short_code)
+          
+          # 2. Augment with analytics (decoration)
+          if status == 200:
+              self._kafka.send("click-events", {
+                  "short_code": short_code,
+                  "timestamp": time.time(),
+                  "ip_hash": hashlib.md5(request_context["ip"].encode()).hexdigest(),
+                  "user_agent": request_context.get("user_agent", ""),
+                  "referer": request_context.get("referer", "direct"),
+                  "country": request_context.get("country", "XX"),
+              })
+          
+          return status, url
+  
+  # Usage: wrap at composition root (main.py)
+  base_service = RedirectService(repo, cache)
+  analytics_service = AnalyticsRedirectService(base_service, kafka_producer)
+  # Now analytics_service IS-A redirect service with bonus tracking.
+  
+  WHY DECORATOR OVER INHERITANCE?
+    Inheritance: AnalyticsRedirectService extends RedirectService.
+    Problem: extends = tightly coupled. If RedirectService changes, child breaks.
+    Problem: can't mix-and-match (e.g., Analytics + RateLimiting + Logging decorators).
+    
+    Decorator: compose behavior at runtime.
+    ratelimited_analytics_logging = 
+        LoggingDecorator(
+            RateLimitDecorator(
+                AnalyticsDecorator(RedirectService(repo, cache))
+            )
+        )
+    Each decorator adds one responsibility. Each class is small and focused (SRP).
+
+TEMPLATE METHOD PATTERN FOR CODE GENERATION:
+
+  Different strategies for generating codes: MD5-hash-based vs counter-based vs random.
+  Template method: defines the algorithm structure, subclasses fill in steps.
+  
+  class BaseCodeGenerator(ABC):
+      """Template method: generate() calls abstract steps."""
+      
+      def generate(self, long_url: str, user_id: int = 0) -> str:
+          raw_input = self._prepare_input(long_url, user_id)  # HOOK 1: subclass defines
+          number = self._compute_number(raw_input)              # HOOK 2: subclass defines
+          code = self._encode(number)                          # SHARED: same encoding
+          return self._postprocess(code)                        # HOOK 3: subclass can override
+      
+      @abstractmethod
+      def _prepare_input(self, long_url: str, user_id: int) -> str: ...
+      
+      @abstractmethod
+      def _compute_number(self, raw: str) -> int: ...
+      
+      def _encode(self, num: int) -> str:
+          """SHARED — base62 encoding. Subclasses don't override this."""
+          CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          result = []
+          while num > 0:
+              result.append(CHARS[num % 62])
+              num //= 62
+          return ''.join(reversed(result)).zfill(7)[:7]
+      
+      def _postprocess(self, code: str) -> str:
+          return code  # default: no postprocessing. Subclasses override if needed.
+  
+  
+  class HashBasedGenerator(BaseCodeGenerator):
+      def _prepare_input(self, url, uid): return f"{url}{uid}{time.time_ns()}"
+      def _compute_number(self, raw): return int(hashlib.md5(raw.encode()).hexdigest(), 16)
+  
+  class SnowflakeGenerator(BaseCodeGenerator):
+      """Counter-based: no collision possible."""
+      def __init__(self, worker_id: int):
+          self._worker_id = worker_id & 0x3FF  # 10-bit worker ID
+          self._sequence = 0
+          self._last_ms = 0
+          self._lock = threading.Lock()
+      
+      def _prepare_input(self, url, uid): return ""  # not needed for counter-based
+      
+      def _compute_number(self, raw) -> int:
+          with self._lock:
+              ms = int(time.time() * 1000)
+              if ms == self._last_ms:
+                  self._sequence = (self._sequence + 1) & 0xFFF  # 12 bits
+                  if self._sequence == 0:
+                      while ms <= self._last_ms:  # wait for next millisecond
+                          ms = int(time.time() * 1000)
+              else:
+                  self._sequence = 0
+              self._last_ms = ms
+              # Snowflake: 41 bits timestamp | 10 bits worker | 12 bits sequence
+              return ((ms - 1609459200000) << 22) | (self._worker_id << 12) | self._sequence
+  
+  BENEFIT: switching from hash-based to snowflake = swap one object in DI container.
+  UrlShortener: zero code changes. Just inject different generator.
+  This is why Template Method + DI is so powerful in interviews.
+
+FULL PRODUCTION FLOW: REQUEST → RESPONSE:
+
+  # This is what the HTTP handler looks like (e.g., FastAPI or Flask)
+  
+  @app.get("/{short_code}")
+  async def redirect(short_code: str, request: Request):
+      # 1. Input sanitization: reject non-alphanumeric codes (prevent injection)
+      if not re.match(r'^[a-zA-Z0-9_-]{1,20}$', short_code):
+          raise HTTPException(400, "Invalid short code format")
+      
+      # 2. Rate limiting (check before any processing)
+      ip = request.client.host
+      if not rate_limiter.allow(ip, limit=100, window_secs=60):
+          raise HTTPException(429, "Rate limit exceeded", headers={"Retry-After": "60"})
+      
+      # 3. Resolve (with analytics decoration)
+      context = {
+          "ip": ip,
+          "user_agent": request.headers.get("user-agent", ""),
+          "referer": request.headers.get("referer", "direct"),
+          "country": geoip.lookup(ip),
+      }
+      status, url = analytics_redirect_service.resolve(short_code, context)
+      
+      # 4. Return appropriate HTTP response
+      if status == 200:
+          return RedirectResponse(url=url, status_code=302)
+          # 302 (temporary redirect) vs 301 (permanent):
+          # 302: browser asks server every time (we WANT this for click tracking + deletion support)
+          # 301: browser caches permanently, never asks again (breaks analytics + deletion)
+      elif status == 404:
+          raise HTTPException(404, f"Short code '{short_code}' not found")
+      elif status == 410:
+          raise HTTPException(410, f"Short code '{short_code}' has expired or been deleted")
+  
+  # Performance profile of this endpoint:
+  # Cache hit: ~2ms total (rate limit check 0.5ms + Redis 1ms + response 0.5ms)
+  # Cache miss: ~10ms total (same + DB query 7ms + cache write 0.5ms)
+  # Concurrent: asyncio allows thousands of concurrent requests on one event loop
+  # Zero thread blocking: all I/O is async (aioredis, asyncpg, etc.)
+```
+
+---
+
+## STEP 9 — Design Principles Checklist
+
+```
+SOLID PRINCIPLES — HOW THIS DESIGN SATISFIES EACH:
+
+S — Single Responsibility Principle (SRP):
+  CodeGenerator: ONLY generates codes. Nothing else.
+  UrlShortener: ONLY orchestrates (creates URLs). Doesn't know HOW code is generated.
+  RedirectService: ONLY resolves codes. Doesn't know how URLs are stored.
+  LRUCache: ONLY caches. Doesn't know it's being used for URL resolution.
+  InMemoryUrlRepository: ONLY stores URLs in memory. Doesn't know about caching or codes.
+  EACH CLASS: one reason to change. ✓
+
+O — Open/Closed Principle (OCP):
+  New storage backend: add PostgresUrlRepository. Don't modify existing classes. ✓
+  New code generation: add SnowflakeGenerator. Don't modify UrlShortener. ✓
+  New caching layer: add RedisCache. Don't modify RedirectService. ✓
+  New analytics: use Decorator pattern. Don't modify RedirectService. ✓
+
+L — Liskov Substitution Principle (LSP):
+  InMemoryUrlRepository can be substituted anywhere IUrlRepository is expected. ✓
+  LRUCache can be substituted anywhere ICacheLayer is expected. ✓
+  All subclasses honor the contract (find() returns Optional[UrlEntry], etc.). ✓
+
+I — Interface Segregation Principle (ISP):
+  IUrlRepository: only URL-specific methods (save, find, delete, exists).
+  ICacheLayer: only cache-specific methods (get, set, delete).
+  No "fat interface" combining unrelated methods. ✓
+  If we needed stats tracking: add IStatsRepository separately.
+
+D — Dependency Inversion Principle (DIP):
+  UrlShortener depends on IUrlRepository (abstract), not InMemoryUrlRepository (concrete). ✓
+  UrlShortener depends on ICacheLayer (abstract), not LRUCache (concrete). ✓
+  High-level module (UrlShortener) doesn't depend on low-level details. ✓
+  Direction of dependency: both point to the INTERFACE. ✓
+
+GANG OF FOUR PATTERNS USED — SUMMARY:
+  Singleton    → CodeGenerator (thread-safe, double-checked locking)
+  Strategy     → IUrlRepository (swap storage backends at runtime)
+  Proxy        → CacheLayer (transparent caching in front of real storage)
+  Facade       → UrlShortener (simple API hiding complex subsystem)
+  Decorator    → AnalyticsRedirectService (add behavior without modification)
+  Template Method → BaseCodeGenerator (algorithm skeleton, subclass fills steps)
+  Builder      → (can be added for UrlEntry with many optional fields)
+  Observer     → (can be added: event bus for URL-created, URL-deleted events)
+
+INTERVIEW SCORING RUBRIC:
+  What interviewers score you on for LLD:
+  ✓ Class diagram before code (shows planning)
+  ✓ Interfaces for every dependency (DIP)
+  ✓ Thread safety addressed (locks, AtomicInteger, ConcurrentHashMap)
+  ✓ At least 2 design patterns named + explained
+  ✓ Error handling (collision, duplicate alias, cache miss)
+  ✓ Code runnable/testable (not pseudocode)
+  ✓ Follow-ups: how to scale, extend, swap components
+
+  What drops scores:
+  ✗ Hardcoding storage (new InMemoryRepo() inside business logic)
+  ✗ No interfaces → can't test, can't swap
+  ✗ No thread safety discussion
+  ✗ Static methods everywhere (not OOP)
+  ✗ One giant class with all logic
+```

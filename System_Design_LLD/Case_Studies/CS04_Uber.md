@@ -1633,3 +1633,157 @@ A: UberPool is a new VehicleType = VehicleType.POOL.
    FareCalculator: PoolPricing implements IFarePricingStrategy (lower per-km, no surge cap).
    No changes to Driver, Location, LocationTracker — Open/Closed Principle preserved.
 ```
+
+
+---
+
+## STEP 8 — Extended Deep-Dives: Advanced Design Patterns in Practice
+
+```
+CONCURRENT ACCESS PATTERNS — THE SUBTLETIES:
+
+  WHY ConcurrentHashMap.newKeySet() in Java:
+    Set<String> followers = new HashSet<>();  // NOT thread-safe
+    Thread A: followers.add("alice");
+    Thread B: followers.add("bob");
+    Result: potential data corruption. HashSet.add() is NOT atomic.
+    
+    Set<String> followers = ConcurrentHashMap.newKeySet();  // thread-safe
+    Internally: ConcurrentHashMap<String, Boolean>. All operations atomic.
+    Why not Collections.synchronizedSet()?
+      synchronizedSet wraps with synchronized block.
+      add() and remove(): one thread at a time. Works but LOW THROUGHPUT.
+      ConcurrentHashMap.newKeySet(): lock-free reads via CAS (Compare-And-Swap).
+      Much higher throughput for read-heavy access (followers list is read very often).
+  
+  THE READ-WRITE LOCK PATTERN (Java ReentrantReadWriteLock):
+    Scenario: followers list accessed thousands of times per second for reads.
+    Writing (follow/unfollow): rare (maybe 100 times/day for average user).
+    
+    synchronized(lock): allows ONLY ONE thread at a time — both reads AND writes exclusive.
+    ReadWriteLock: multiple readers simultaneously. Only one writer at a time.
+    
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    // Read: acquire read lock (multiple threads can hold read lock simultaneously)
+    public int getFollowerCount() {
+        lock.readLock().lock();
+        try {
+            return followers.size();  // can be read by 1000 threads simultaneously
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    // Write: acquire write lock (exclusive — waits for all readers to finish)
+    public boolean follow(User target) {
+        lock.writeLock().lock();
+        try {
+            return following.add(target.getId());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    Performance gain: 100× read throughput vs plain synchronized.
+    Read-heavy workload (99% reads, 1% writes) → ReadWriteLock is dramatically faster.
+    
+    When NOT to use ReadWriteLock:
+      Write-heavy workloads: write lock contention → worse than synchronized.
+      Very short critical sections: overhead of RWLock > benefit.
+      Rule of thumb: reads > 10× writes → ReadWriteLock wins.
+
+ATOMIC OPERATIONS IN JAVA — WHEN TO USE WHAT:
+  
+  AtomicInteger vs volatile vs synchronized:
+  
+  volatile int counter = 0;
+  counter++;  // NOT thread-safe! Three operations: read, increment, write.
+  // Thread A reads 5, Thread B reads 5, A writes 6, B writes 6. Incremented ONCE. Wrong.
+  
+  AtomicInteger counter = new AtomicInteger(0);
+  counter.incrementAndGet();  // THREAD-SAFE. Single atomic hardware instruction (LOCK ADD).
+  
+  int count = counter.get();  // Thread-safe read.
+  counter.compareAndSet(expected, newValue);  // CAS: only updates if current == expected.
+  
+  When to use AtomicInteger:
+    Single-field counter that only increments/decrements.
+    Like: clickCount, likeCount, retryCount.
+  
+  When AtomicInteger is NOT enough:
+    Need to update TWO related fields atomically.
+    E.g., "transfer $100: decrease account A, increase account B" — need synchronized.
+    AtomicInteger: each field is atomic, but the COMBINATION isn't. Race condition possible.
+    Fix: synchronized block covering BOTH updates, or compare-and-swap loop.
+
+IMMUTABILITY AS A CONCURRENCY TOOL:
+  
+  Location is a frozen dataclass (Python) / Java record.
+  Immutable = no setters = shared freely between threads without locking.
+  
+  Why immutability is the BEST concurrency solution:
+    No mutation → no race condition possible → no locks needed → faster.
+  
+  Make as many objects immutable as possible:
+    All "value objects" (Location, MediaMeta, UrlEntry): immutable. ✓
+    All "service objects" (UrlShortener, FeedService): mutable (have state). Use locks.
+  
+  In Java: use records (Java 16+) for immutable value objects.
+  In C++: use const member variables + no setters.
+  In Python: use @dataclass(frozen=True).
+```
+
+---
+
+## STEP 9 — System Design Upgrade Paths
+
+```
+HOW THIS LLD EVOLVES TO PRODUCTION:
+
+LEVEL 1: Single Process (current LLD)
+  InMemoryRepository: dict in RAM.
+  LRUCache: OrderedDict in process.
+  Single thread or very limited concurrency.
+  Scale: up to 100K entries. Suitable for demo.
+
+LEVEL 2: Single Machine, Multiple Threads
+  Replace dict with PostgreSQL + connection pool (psycopg2/asyncpg).
+  Replace LRUCache with Redis (redisio library).
+  Uvicorn/Gunicorn: 4 workers × 8 threads = 32 concurrent request handlers.
+  Scale: millions of entries, thousands requests/sec.
+  Code change: only change what gets INJECTED (Strategy Pattern saves us).
+    repo = PostgresUrlRepository(db_pool)  # one line change
+    cache = RedisCacheLayer(redis_client)  # one line change
+    shortener = UrlShortener(repo, cache)  # zero changes to this class
+
+LEVEL 3: Multi-Machine (Microservices)
+  UrlShortener → ShortenService (containerized, stateless, scale horizontally).
+  RedirectService → RedirectService (separate container, optimized for reads).
+  PostgreSQL → PostgreSQL cluster (1 primary + 3 read replicas + Pgpool-II load balancer).
+  Redis → Redis Cluster (6 nodes, 3 primary + 3 replica).
+  API Gateway → Kong (handles auth, rate limiting, routing).
+  Scale: millions of requests/sec. 99.99% availability.
+
+LEVEL 4: Global Scale (bit.ly / TinyURL scale)
+  Database → sharded PostgreSQL (10 shards × consistent hashing).
+  CDN → Cloudflare (redirects served at CDN edge, < 5ms globally).
+  Analytics → ClickHouse (50B click events/day, < 1s aggregation queries).
+  Multi-region → US + EU + APAC (3 regions × full stack).
+  Scale: 100M URLs, 10B redirects/day. < 10ms p99 globally.
+  Code changes: none to core business logic. Only infra config changes.
+  The LLD design held up to 100,000× scale increase. This is the power of good OOP design.
+
+INTERVIEW TIP — HOW TO TRANSITION FROM LLD TO HLD:
+  After showing LLD code, interviewer asks "how would this scale?"
+  
+  1. Identify the bottleneck (InMemoryRepository can't handle 578K reads/sec).
+  2. Replace the specific component (not the entire system):
+     "I'd replace InMemoryUrlRepository with a sharded PostgreSQL repository.
+     The IUrlRepository interface means UrlShortener doesn't change at all."
+  3. Discuss the HLD implications (sharding, caching, CDN) in terms of your LLD design.
+  4. Show you understand the PROGRESSION from clean OOP to distributed systems.
+  
+  This answer demonstrates: LLD mastery + HLD thinking + evolutionary design mindset.
+  MAANG interviewers specifically look for this progression.
+```

@@ -1500,3 +1500,243 @@ A:
     return MultiCityBooking(holdings)
   This is a SAGA pattern: compensating transactions on failure.
 ```
+
+
+---
+
+## STEP 7 — Deep-Dive: GDS Integration and Real-Time Inventory
+
+```
+WHAT IS A GDS?
+  GDS = Global Distribution System.
+  Three major players: Amadeus (EU), Sabre (US), Travelport (UK).
+  
+  Airlines publish their flight inventory to GDS.
+  OTAs (MakeMyTrip, Expedia, Booking.com) query GDS to get real-time availability and prices.
+  
+  WHY GDS EXISTS:
+    Without GDS: Expedia must integrate directly with 500+ airlines individually.
+    500 different APIs, different formats, different auth systems.
+    With GDS: one API → access to all 500+ airlines. Expedia integrates once.
+    GDS acts as a broker between airlines and OTAs.
+  
+  GDS REVENUE MODEL:
+    Airlines pay GDS per booking (booking fee, typically $3-10 per segment).
+    OTAs pay GDS for API access (subscription + per-search fees).
+    GDS revenue: billions per year.
+
+LLD — GDS ADAPTER PATTERN:
+
+  class IGDS(ABC):
+      """Interface for any GDS provider."""
+      
+      @abstractmethod
+      def search_flights(self, origin: str, destination: str, date: str, 
+                         passengers: int) -> List[GDSFlightResult]:
+          ...
+      
+      @abstractmethod
+      def create_pnr(self, flight_id: str, passengers: List[PassengerData]) -> str:
+          """Create Passenger Name Record (PNR) = the booking record."""
+          ...
+      
+      @abstractmethod
+      def issue_ticket(self, pnr: str, payment: PaymentData) -> str:
+          """Issue the actual e-ticket. Returns ticket number."""
+          ...
+      
+      @abstractmethod
+      def cancel_pnr(self, pnr: str) -> RefundDetails:
+          ...
+  
+  class AmadeusGDS(IGDS):
+      """Adapter for Amadeus GDS API."""
+      BASE_URL = "https://api.amadeus.com/v2"
+      
+      def __init__(self, client_id: str, client_secret: str):
+          self._client_id = client_id
+          self._client_secret = client_secret
+          self._access_token = None
+          self._token_expiry = None
+      
+      def _ensure_token(self):
+          """OAuth2 client credentials flow. Token expires every 30 minutes."""
+          if self._access_token and datetime.utcnow() < self._token_expiry:
+              return  # Token still valid
+          
+          # POST to token endpoint
+          response = requests.post(
+              f"{self.BASE_URL}/security/oauth2/token",
+              data={
+                  "grant_type": "client_credentials",
+                  "client_id": self._client_id,
+                  "client_secret": self._client_secret
+              }
+          )
+          token_data = response.json()
+          self._access_token = token_data["access_token"]
+          self._token_expiry = datetime.utcnow() + timedelta(
+              seconds=token_data["expires_in"] - 60  # Refresh 1 min before expiry
+          )
+      
+      def search_flights(self, origin, destination, date, passengers) -> List[GDSFlightResult]:
+          self._ensure_token()
+          
+          response = requests.get(
+              f"{self.BASE_URL}/shopping/flight-offers",
+              headers={"Authorization": f"Bearer {self._access_token}"},
+              params={
+                  "originLocationCode": origin,
+                  "destinationLocationCode": destination,
+                  "departureDate": date,  # "2025-12-25" format
+                  "adults": passengers,
+                  "max": 50  # limit results
+              }
+          )
+          
+          # Parse Amadeus-specific response format → our GDSFlightResult format
+          return [self._parse_offer(offer) for offer in response.json().get("data", [])]
+      
+      def _parse_offer(self, offer: dict) -> GDSFlightResult:
+          """Convert Amadeus API response format to our internal format."""
+          itinerary = offer["itineraries"][0]
+          segment = itinerary["segments"][0]
+          price = offer["price"]
+          
+          return GDSFlightResult(
+              gds_offer_id=offer["id"],
+              origin=segment["departure"]["iataCode"],
+              destination=segment["arrival"]["iataCode"],
+              departure_time=segment["departure"]["at"],
+              arrival_time=segment["arrival"]["at"],
+              airline_code=segment["carrierCode"],
+              flight_number=segment["number"],
+              total_price=Decimal(price["total"]),
+              currency=price["currency"],
+              seats_available=offer.get("numberOfBookableSeats", 9),
+              cabin_class=offer["travelerPricings"][0]["fareDetailsBySegment"][0]["cabin"]
+          )
+  
+  class SabreGDS(IGDS):
+      """Adapter for Sabre GDS API (different format, same interface)."""
+      # Different Sabre-specific implementation
+      # But same IGDS interface → SearchService.search_flights() doesn't need to change
+      pass
+  
+  # ADAPTER PATTERN IN ACTION:
+  class SearchService:
+      def __init__(self, gds: IGDS):  # Inject the GDS
+          self._gds = gds
+      
+      def search_flights(self, origin, destination, date, passengers) -> List[FlightSearchResult]:
+          # Works with Amadeus, Sabre, or Travelport — same interface
+          gds_results = self._gds.search_flights(origin, destination, date, passengers)
+          return [self._convert(r) for r in gds_results]
+  
+  # At startup: choose which GDS to use
+  service = SearchService(gds=AmadeusGDS(CLIENT_ID, CLIENT_SECRET))
+  # To switch to Sabre: SearchService(gds=SabreGDS(...)) — zero other changes.
+
+PRICE CACHING STRATEGY:
+  Problem: GDS search is expensive (takes 500ms-2s, costs money per search).
+  At scale: millions of searches per hour × $0.01/search = thousands of dollars/hour.
+  
+  Solution: cache search results.
+    Cache key: (origin, destination, date, passengers, cabin_class) → results
+    TTL: 5 minutes (prices change rapidly, but not every second)
+    
+    Redis caching:
+    def search_flights_cached(self, origin, dest, date, passengers):
+        cache_key = f"search:{origin}:{dest}:{date}:{passengers}"
+        cached = redis.get(cache_key)
+        if cached:
+            return json.loads(cached)  # Return cached results
+        
+        # Cache miss: call GDS
+        results = self._gds.search_flights(origin, dest, date, passengers)
+        redis.setex(cache_key, 300, json.dumps(results))  # Cache 5 minutes
+        return results
+    
+    Cache hit rate: 60-70% (many users search same routes, prices are valid for a few minutes).
+    Cost reduction: 60% fewer GDS API calls = significant savings.
+    
+    When to NOT cache:
+      Booking time: always call GDS for fresh inventory (never book on stale cache).
+      Price guarantee: at hold time, re-fetch from GDS to ensure current price.
+```
+
+---
+
+## STEP 8 — Deep-Dive: SOLID and Pattern Summary
+
+```
+COMPLETE PATTERN CATALOG FOR TRAVEL BOOKING LLD:
+
+STRATEGY PATTERN — THREE USES:
+  
+  1. Pricing Strategy (IPricingStrategy):
+     DynamicPricingStrategy (most flights) vs FixedPricingStrategy (corporate contracts).
+     Swap at runtime: corporate user → fixed pricing, retail user → dynamic.
+     
+  2. Cancellation Policy (ICancellationPolicy):
+     Flexible / Moderate / Strict / NonRefundable.
+     Different policies for different booking tiers.
+     Adding "SuperFlexible" policy: new class only. Zero change to HotelBooking.
+     
+  3. GDS Provider (IGDS):
+     Amadeus / Sabre / Travelport.
+     Swap provider: one config change. All business logic unchanged.
+  
+  STRATEGY PATTERN TELLS THE INTERVIEWER:
+    You understand Open/Closed Principle.
+    You can design for extensibility without modification.
+    You think in terms of behavior as an object, not hardcoded logic.
+
+OBSERVER PATTERN — Booking Notifications:
+  Subject: BookingService (emits booking events).
+  Observers: EmailService, SMSService, PushNotificationService.
+  
+  When booking is confirmed:
+    booking_service.notify_observers(BookingEvent.CONFIRMED, booking)
+    
+    → EmailService.on_event(): send confirmation email with e-ticket PDF.
+    → SMSService.on_event(): send SMS "Booking confirmed! PNR: ABC123".
+    → PushNotificationService.on_event(): push to user's mobile app.
+  
+  Adding WhatsApp notification: new WhatsAppService(IBookingObserver). Zero code change to BookingService.
+
+COMPOSITE PATTERN — Itinerary:
+  A trip = list of segments (flights, hotels, transfers).
+  Each segment can be:
+    Leaf: FlightBooking (atomic, indivisible)
+    Composite: MultiCityItinerary (contains multiple FlightBookings + HotelBookings)
+  
+  Both implement IBooking:
+    cancel() → leaf cancels one; composite cancels all with rollback.
+    get_total_price() → leaf returns its own; composite sums children.
+  
+  Client code: treats individual bookings and multi-city itineraries identically.
+  MakeMyTripService.cancel(booking_id) → doesn't know if it's a leaf or composite.
+
+TEMPLATE METHOD — Payment Processing:
+  Abstract flow: validate → hold inventory → process payment → confirm → notify.
+  FlightBookingProcessor and HotelBookingProcessor:
+    Both follow same template.
+    "hold inventory" step differs (seats for flights, room count for hotels).
+  
+  Base class defines order of steps. Subclasses override the step-specific logic.
+
+INTERVIEW TIP — How to narrate patterns to interviewers:
+  
+  Don't just say "I used Strategy Pattern."
+  Say:
+    "For cancellation policies, I used the Strategy Pattern.
+    HotelBooking has a reference to ICancellationPolicy (an interface).
+    The concrete policy (Flexible, Moderate, Strict) is injected at booking creation time.
+    When the user cancels, HotelBooking calls policy.calculate_refund() — it doesn't need
+    to know which specific policy it is.
+    If the business adds a new 'Platinum' policy, I just write a new class.
+    HotelBooking doesn't change. That's the Open/Closed Principle."
+  
+  This level of articulation = MAANG-level LLD interview performance.
+```

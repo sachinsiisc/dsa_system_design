@@ -1058,7 +1058,7 @@ if __name__ == "__main__":
 
 ---
 
-## STEP 4 — Java Key Patterns
+## STEP 4 — Java Implementation (Every Line Explained)
 
 ```java
 // Java: Thread-safe Set for likes with ConcurrentHashMap
@@ -1295,3 +1295,1015 @@ A:
   
   Ranking factors: recency (freshness), author authority (verified?), engagement.
 ```
+
+
+---
+
+## STEP 8 — Extended Deep-Dives: Advanced Design Patterns in Practice
+
+```
+CONCURRENT ACCESS PATTERNS — THE SUBTLETIES:
+
+  WHY ConcurrentHashMap.newKeySet() in Java:
+    Set<String> followers = new HashSet<>();  // NOT thread-safe
+    Thread A: followers.add("alice");
+    Thread B: followers.add("bob");
+    Result: potential data corruption. HashSet.add() is NOT atomic.
+    
+    Set<String> followers = ConcurrentHashMap.newKeySet();  // thread-safe
+    Internally: ConcurrentHashMap<String, Boolean>. All operations atomic.
+    Why not Collections.synchronizedSet()?
+      synchronizedSet wraps with synchronized block.
+      add() and remove(): one thread at a time. Works but LOW THROUGHPUT.
+      ConcurrentHashMap.newKeySet(): lock-free reads via CAS (Compare-And-Swap).
+      Much higher throughput for read-heavy access (followers list is read very often).
+  
+  THE READ-WRITE LOCK PATTERN (Java ReentrantReadWriteLock):
+    Scenario: followers list accessed thousands of times per second for reads.
+    Writing (follow/unfollow): rare (maybe 100 times/day for average user).
+    
+    synchronized(lock): allows ONLY ONE thread at a time — both reads AND writes exclusive.
+    ReadWriteLock: multiple readers simultaneously. Only one writer at a time.
+    
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    // Read: acquire read lock (multiple threads can hold read lock simultaneously)
+    public int getFollowerCount() {
+        lock.readLock().lock();
+        try {
+            return followers.size();  // can be read by 1000 threads simultaneously
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    // Write: acquire write lock (exclusive — waits for all readers to finish)
+    public boolean follow(User target) {
+        lock.writeLock().lock();
+        try {
+            return following.add(target.getId());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    Performance gain: 100× read throughput vs plain synchronized.
+    Read-heavy workload (99% reads, 1% writes) → ReadWriteLock is dramatically faster.
+    
+    When NOT to use ReadWriteLock:
+      Write-heavy workloads: write lock contention → worse than synchronized.
+      Very short critical sections: overhead of RWLock > benefit.
+      Rule of thumb: reads > 10× writes → ReadWriteLock wins.
+
+ATOMIC OPERATIONS IN JAVA — WHEN TO USE WHAT:
+  
+  AtomicInteger vs volatile vs synchronized:
+  
+  volatile int counter = 0;
+  counter++;  // NOT thread-safe! Three operations: read, increment, write.
+  // Thread A reads 5, Thread B reads 5, A writes 6, B writes 6. Incremented ONCE. Wrong.
+  
+  AtomicInteger counter = new AtomicInteger(0);
+  counter.incrementAndGet();  // THREAD-SAFE. Single atomic hardware instruction (LOCK ADD).
+  
+  int count = counter.get();  // Thread-safe read.
+  counter.compareAndSet(expected, newValue);  // CAS: only updates if current == expected.
+  
+  When to use AtomicInteger:
+    Single-field counter that only increments/decrements.
+    Like: clickCount, likeCount, retryCount.
+  
+  When AtomicInteger is NOT enough:
+    Need to update TWO related fields atomically.
+    E.g., "transfer $100: decrease account A, increase account B" — need synchronized.
+    AtomicInteger: each field is atomic, but the COMBINATION isn't. Race condition possible.
+    Fix: synchronized block covering BOTH updates, or compare-and-swap loop.
+
+IMMUTABILITY AS A CONCURRENCY TOOL:
+  
+  Location is a frozen dataclass (Python) / Java record.
+  Immutable = no setters = shared freely between threads without locking.
+  
+  Why immutability is the BEST concurrency solution:
+    No mutation → no race condition possible → no locks needed → faster.
+  
+  Make as many objects immutable as possible:
+    All "value objects" (Location, MediaMeta, UrlEntry): immutable. ✓
+    All "service objects" (UrlShortener, FeedService): mutable (have state). Use locks.
+  
+  In Java: use records (Java 16+) for immutable value objects.
+  In C++: use const member variables + no setters.
+  In Python: use @dataclass(frozen=True).
+```
+
+---
+
+## STEP 9 — System Design Upgrade Paths
+
+```
+HOW THIS LLD EVOLVES TO PRODUCTION:
+
+LEVEL 1: Single Process (current LLD)
+  InMemoryRepository: dict in RAM.
+  LRUCache: OrderedDict in process.
+  Single thread or very limited concurrency.
+  Scale: up to 100K entries. Suitable for demo.
+
+LEVEL 2: Single Machine, Multiple Threads
+  Replace dict with PostgreSQL + connection pool (psycopg2/asyncpg).
+  Replace LRUCache with Redis (redisio library).
+  Uvicorn/Gunicorn: 4 workers × 8 threads = 32 concurrent request handlers.
+  Scale: millions of entries, thousands requests/sec.
+  Code change: only change what gets INJECTED (Strategy Pattern saves us).
+    repo = PostgresUrlRepository(db_pool)  # one line change
+    cache = RedisCacheLayer(redis_client)  # one line change
+    shortener = UrlShortener(repo, cache)  # zero changes to this class
+
+LEVEL 3: Multi-Machine (Microservices)
+  UrlShortener → ShortenService (containerized, stateless, scale horizontally).
+  RedirectService → RedirectService (separate container, optimized for reads).
+  PostgreSQL → PostgreSQL cluster (1 primary + 3 read replicas + Pgpool-II load balancer).
+  Redis → Redis Cluster (6 nodes, 3 primary + 3 replica).
+  API Gateway → Kong (handles auth, rate limiting, routing).
+  Scale: millions of requests/sec. 99.99% availability.
+
+LEVEL 4: Global Scale (bit.ly / TinyURL scale)
+  Database → sharded PostgreSQL (10 shards × consistent hashing).
+  CDN → Cloudflare (redirects served at CDN edge, < 5ms globally).
+  Analytics → ClickHouse (50B click events/day, < 1s aggregation queries).
+  Multi-region → US + EU + APAC (3 regions × full stack).
+  Scale: 100M URLs, 10B redirects/day. < 10ms p99 globally.
+  Code changes: none to core business logic. Only infra config changes.
+  The LLD design held up to 100,000× scale increase. This is the power of good OOP design.
+
+INTERVIEW TIP — HOW TO TRANSITION FROM LLD TO HLD:
+  After showing LLD code, interviewer asks "how would this scale?"
+  
+  1. Identify the bottleneck (InMemoryRepository can't handle 578K reads/sec).
+  2. Replace the specific component (not the entire system):
+     "I'd replace InMemoryUrlRepository with a sharded PostgreSQL repository.
+     The IUrlRepository interface means UrlShortener doesn't change at all."
+  3. Discuss the HLD implications (sharding, caching, CDN) in terms of your LLD design.
+  4. Show you understand the PROGRESSION from clean OOP to distributed systems.
+  
+  This answer demonstrates: LLD mastery + HLD thinking + evolutionary design mindset.
+  MAANG interviewers specifically look for this progression.
+```
+
+
+---
+
+## STEP 4 â€” Java Implementation (Full â€” Every Line Explained)
+
+> **What's NEW below**: A complete, runnable Java system with the same depth as the Python implementation. Every class, method, and concurrency construct is explained line by line.
+
+```java
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Twitter/X  â€”  Full Java LLD  (every line explained)
+// Java differences vs Python:
+//   1. Explicit types  (String, int, Optional<Tweet> â€” no duck typing)
+//   2. AtomicInteger   (lock-free thread-safe counters via hardware CAS)
+//   3. ConcurrentHashMap.newKeySet() (thread-safe Set, no synchronized needed)
+//   4. ReentrantReadWriteLock  (many readers / one writer â€” much faster than synchronized)
+//   5. Optional<T>  (explicit null-safety contract)
+//   6. record keyword (Java 16+) for immutable value objects
+//   7. Stream API  (map/filter/sorted/collect â€” replaces Python list comprehensions)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+import java.time.Instant;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+import java.util.stream.*;
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ENUMS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+enum TweetType { ORIGINAL, REPLY, RETWEET, QUOTE_TWEET }
+// Java enums are classes â€” can have fields/methods.
+// Unlike Python's Enum: no .value needed; switch/case works directly.
+
+enum NotifType { NEW_FOLLOWER, LIKE, RETWEET, REPLY, MENTION }
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TWEET  (mutable entity â€” counters change after creation)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class Tweet {
+    private final String id;          // UUID string â€” globally unique
+    private final String authorId;    // User's UUID (not the User object â€” avoids circular refs)
+    private final String text;        // Tweet content (max 280 chars)
+    private final TweetType type;
+    private final String parentId;    // null for original tweets; parent tweet_id for replies/RTs
+    private final Instant createdAt;
+
+    // â”€â”€ Thread-safe counters using AtomicInteger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // WHY NOT: private int likeCount = 0 ?
+    //   int is NOT thread-safe. likeCount++ is THREE operations:
+    //     1. READ likeCount from memory
+    //     2. ADD 1
+    //     3. WRITE back to memory
+    //   If Thread A and Thread B both read 5 â†’ both write 6 â†’ count should be 7 but is 6.
+    //   This is a RACE CONDITION.
+    //
+    // AtomicInteger uses CAS (Compare-And-Swap) â€” a single CPU instruction:
+    //   CAS(expected=5, new=6): "if memory holds 5, replace with 6 â€” atomically"
+    //   If another thread changed it to 6 between read and write: CAS fails â†’ retry.
+    //   No lock acquisition â†’ no thread blocking â†’ very high throughput.
+    private final AtomicInteger likeCount    = new AtomicInteger(0);
+    private final AtomicInteger retweetCount = new AtomicInteger(0);
+    private final AtomicInteger replyCount   = new AtomicInteger(0);
+
+    // â”€â”€ Thread-safe Set for tracking who liked â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // WHY NOT HashSet?
+    //   HashSet is NOT thread-safe. Concurrent put operations corrupt the internal array.
+    //   Java's HashMap/HashSet can throw ConcurrentModificationException or infinite loop.
+    //
+    // WHY NOT Collections.synchronizedSet(new HashSet<>())?
+    //   synchronizedSet wraps with ONE global lock.
+    //   Only ONE thread can add/remove/contains at a time.
+    //   10,000 concurrent reads: all blocked waiting for the lock. Poor scalability.
+    //
+    // WHY ConcurrentHashMap.newKeySet()?
+    //   Backed by ConcurrentHashMap which uses lock striping (16 separate locks by default).
+    //   Different keys hash to different stripes â†’ parallel operations on different keys.
+    //   Reads (contains): LOCK-FREE â€” use volatile reads + CAS, never block.
+    //   Writes (add/remove): only lock the affected stripe (1/16 of the map).
+    //   Result: ~16x more concurrent throughput vs synchronized set.
+    private final Set<String> likedByUserIds = ConcurrentHashMap.newKeySet();
+
+    // â”€â”€ volatile for simple flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // volatile guarantees VISIBILITY: if Thread A sets isDeleted=true,
+    // Thread B immediately sees isDeleted=true (not a stale cached CPU-register value).
+    //
+    // WHY NOT just private boolean isDeleted?
+    //   Without volatile: CPU cores cache variables in L1/L2 registers.
+    //   Thread A (core 1): sets isDeleted=true in its register. Writes to RAM later.
+    //   Thread B (core 2): reads isDeleted from its own cache â†’ still sees false.
+    //   This is a VISIBILITY BUG (no data race, just stale read).
+    //
+    // volatile does NOT prevent compound race conditions (read-then-write).
+    // For those: use AtomicBoolean.compareAndSet() or synchronized.
+    private volatile boolean isDeleted = false;
+
+    public Tweet(String authorId, String text, TweetType type, String parentId) {
+        this.id        = UUID.randomUUID().toString();
+        // UUID.randomUUID(): generates a cryptographically random 128-bit UUID.
+        // toString(): "550e8400-e29b-41d4-a716-446655440000" (hyphenated hex format)
+        this.authorId  = Objects.requireNonNull(authorId, "authorId cannot be null");
+        // Objects.requireNonNull: throws NullPointerException with clear message if null.
+        // Fail fast at construction (better than NullPointerException deep in business logic).
+        this.text      = validateText(text);
+        this.type      = type;
+        this.parentId  = parentId;
+        this.createdAt = Instant.now();
+        // Instant.now(): current UTC time as a point on the timeline.
+        // Unlike Python's datetime.utcnow(): Instant is timezone-agnostic by design.
+    }
+
+    private String validateText(String text) {
+        if (text == null || text.isBlank())  // isBlank(): true for null/empty/whitespace (Java 11+)
+            throw new IllegalArgumentException("Tweet text cannot be blank");
+        if (text.length() > 280)
+            throw new IllegalArgumentException("Tweet exceeds 280 characters: " + text.length());
+        return text;
+    }
+
+    /** Like this tweet. Returns true if this is a NEW like (not already liked). */
+    public boolean like(String userId) {
+        // Set.add() returns: true if element was NOT already present (new like added)
+        //                    false if element was already present (duplicate like)
+        // ConcurrentHashMap.newKeySet().add() is ATOMIC â€” no race condition.
+        if (likedByUserIds.add(userId)) {
+            likeCount.incrementAndGet();
+            // incrementAndGet(): atomically increments and returns the NEW value.
+            // Equivalent to: ++likeCount (but thread-safe).
+            // Returns new value (useful for logging: "you are the 1,000th liker!").
+            return true;
+        }
+        return false;  // Already liked â€” idempotent (calling like() twice has no extra effect)
+    }
+
+    public boolean unlike(String userId) {
+        if (likedByUserIds.remove(userId)) {
+            likeCount.decrementAndGet();
+            // decrementAndGet(): atomically decrements and returns new value.
+            // Like incrementAndGet but -1. Returns new value.
+            return true;
+        }
+        return false;
+    }
+
+    /** Parse hashtags from tweet text. Example: "#LLD wins" â†’ ["lld", "wins"] (no '#') */
+    public List<String> getHashtags() {
+        // Arrays.stream(array): convert array to a Stream for functional operations.
+        // text.split("\\s+"): split by one or more whitespace chars. \\s = whitespace, + = one or more.
+        // Returns: String[] of words.
+        return Arrays.stream(text.split("\\s+"))
+                .filter(w -> w.startsWith("#") && w.length() > 1)
+                // filter: keep only words starting with '#' and not just '#' alone.
+                // Predicate: w -> boolean expression. Returns new stream with only matching elements.
+                .map(w -> w.substring(1).toLowerCase())
+                // map: transform each element. substring(1) removes first char ('#').
+                // toLowerCase(): normalize for comparison ("LLD" and "lld" are the same tag).
+                .collect(Collectors.toUnmodifiableList());
+                // collect: terminal operation â€” materializes stream into a collection.
+                // Collectors.toUnmodifiableList(): result is immutable (callers can't modify).
+    }
+
+    /** Parse @mentions from tweet text. */
+    public List<String> getMentions() {
+        return Arrays.stream(text.split("\\s+"))
+                .filter(w -> w.startsWith("@") && w.length() > 1)
+                .map(w -> w.substring(1).toLowerCase())
+                .collect(Collectors.toUnmodifiableList());
+    }
+
+    public void softDelete() {
+        isDeleted = true;    // volatile write â€” immediately visible to all threads
+        // SOFT DELETE: mark as deleted but keep in DB.
+        // Why? Replies reference parentId. Hard delete breaks reply threads.
+        // Deleted tweet's text replaced with "Tweet unavailable" at display layer.
+    }
+
+    // Getters â€” no setters (content immutable after creation, counters use atomic ops above)
+    public String      getId()         { return id; }
+    public String      getAuthorId()   { return authorId; }
+    public String      getText()       { return text; }
+    public TweetType   getType()       { return type; }
+    public String      getParentId()   { return parentId; }
+    public Instant     getCreatedAt()  { return createdAt; }
+    public int         getLikeCount()  { return likeCount.get(); }
+    // AtomicInteger.get(): reads the current value atomically (volatile read).
+    public int         getRtCount()    { return retweetCount.get(); }
+    public int         getReplyCount() { return replyCount.get(); }
+    public boolean     isVisible()     { return !isDeleted; }
+    public boolean     isLikedBy(String userId) { return likedByUserIds.contains(userId); }
+
+    public void incrementRetweet() { retweetCount.incrementAndGet(); }
+    public void incrementReply()   { replyCount.incrementAndGet(); }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// USER
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class User {
+    private final String  id;
+    private final String  username;     // Lowercase @handle
+    private final String  displayName;
+    private final Instant joinedAt;
+
+    // Two thread-safe sets for social graph:
+    private final Set<String> followerIds  = ConcurrentHashMap.newKeySet();
+    private final Set<String> followingIds = ConcurrentHashMap.newKeySet();
+
+    // Separate AtomicInteger counters for O(1) count reads.
+    // WHY not just followerIds.size()?
+    //   ConcurrentHashMap.size() under concurrent modification may be slightly inaccurate
+    //   (it sums up across stripes). Not a problem for non-critical counts.
+    //   But AtomicInteger.get() is a single volatile read â†’ guaranteed O(1) accurate.
+    private final AtomicInteger followerCount  = new AtomicInteger(0);
+    private final AtomicInteger followingCount = new AtomicInteger(0);
+
+    public User(String username, String displayName) {
+        this.id          = UUID.randomUUID().toString();
+        this.username    = username.toLowerCase().trim();
+        this.displayName = displayName;
+        this.joinedAt    = Instant.now();
+    }
+
+    /**
+     * Follow another user. Thread-safe â€” both sets use ConcurrentHashMap.newKeySet().
+     * Note: the two updates (follower's followingIds + target's followerIds) are NOT
+     * performed atomically together. In a distributed system this would use eventual
+     * consistency or a distributed transaction.
+     */
+    public boolean follow(User target) {
+        if (this.id.equals(target.id)) return false;  // Cannot follow yourself
+
+        boolean added = followingIds.add(target.id);
+        // Set.add() returns: true if element was new (follow was added), false if duplicate.
+        if (added) {
+            followingCount.incrementAndGet();
+            target.followerIds.add(this.id);    // Update the OTHER user's follower set
+            target.followerCount.incrementAndGet();
+        }
+        return added;
+    }
+
+    public boolean unfollow(User target) {
+        boolean removed = followingIds.remove(target.id);
+        if (removed) {
+            followingCount.decrementAndGet();
+            target.followerIds.remove(this.id);
+            target.followerCount.decrementAndGet();
+        }
+        return removed;
+    }
+
+    /** Celebrity threshold: 1 million followers triggers pull fanout model. */
+    public boolean isCelebrity() {
+        // 1_000_000: Java numeric literal with underscores (Java 7+, purely cosmetic).
+        // Identical to 1000000. Compiler ignores underscores.
+        return followerCount.get() > 1_000_000;
+    }
+
+    public boolean isFollowing(User other) { return followingIds.contains(other.id); }
+
+    // Return unmodifiable views so callers can iterate but not mutate.
+    // Collections.unmodifiableSet(s): any mutation attempt throws UnsupportedOperationException.
+    // Defensive programming: prevents callers from directly adding to followerIds.
+    public Set<String> getFollowerIds()  { return Collections.unmodifiableSet(followerIds); }
+    public Set<String> getFollowingIds() { return Collections.unmodifiableSet(followingIds); }
+
+    public String getId()            { return id; }
+    public String getUsername()      { return username; }
+    public String getDisplayName()   { return displayName; }
+    public int    getFollowerCount() { return followerCount.get(); }
+    public int    getFollowingCount(){ return followingCount.get(); }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TIMELINE  (per-user circular buffer of tweet IDs)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class Timeline {
+    // ArrayDeque: resizable array-backed double-ended queue.
+    // WHY NOT LinkedList?
+    //   LinkedList stores each element in a Node object (extra heap allocation).
+    //   ArrayDeque uses a single backing array â€” better cache locality.
+    //   addFirst/addLast/pollFirst/pollLast: all O(1) amortized for ArrayDeque.
+    //   Random access (get(i)): O(n) for both, but we never need random access here.
+    private final ArrayDeque<String> tweetIds;
+    private final int maxCapacity;
+
+    // ReentrantReadWriteLock: the KEY concurrency tool for read-heavy workloads.
+    //
+    // Plain synchronized: allows ONLY ONE thread at a time â€” even for pure reads.
+    //   1000 threads reading timeline â†’ 999 blocked. Maximum throughput: 1 reader/slot.
+    //
+    // ReentrantReadWriteLock:
+    //   ReadLock:  SHARED. Many threads can hold simultaneously. Reading never blocks reading.
+    //   WriteLock: EXCLUSIVE. Only ONE thread at a time. Blocks all readers while writing.
+    //
+    // Use case: timeline reads happen millions of times/second; writes (new tweets) are rare.
+    // ReadWriteLock lets all readers proceed concurrently. Writers get exclusive access briefly.
+    //
+    // "Reentrant" = a thread that already holds the lock can acquire it again (no self-deadlock).
+    //   Without reentrant: method A holds lock â†’ calls method B which needs same lock â†’ DEADLOCK.
+    //   With reentrant: A holds lock â†’ calls B â†’ B acquires the lock again (same thread) â†’ OK.
+    private final ReentrantReadWriteLock rwLock   = new ReentrantReadWriteLock();
+    private final Lock                   readLock  = rwLock.readLock();
+    private final Lock                   writeLock = rwLock.writeLock();
+
+    public Timeline(int maxCapacity) {
+        this.maxCapacity = maxCapacity;
+        this.tweetIds    = new ArrayDeque<>(maxCapacity);
+        // new ArrayDeque<>(initialCapacity): pre-allocates internal array.
+        // Avoids repeated array resizing. Performance optimization.
+    }
+
+    /** Add tweet ID to the front (newest tweets first). Evicts oldest if at capacity. */
+    public void addTweetId(String tweetId) {
+        writeLock.lock();    // Acquire EXCLUSIVE write lock. All readers blocked until we unlock.
+        try {
+            if (tweetIds.size() >= maxCapacity) {
+                tweetIds.pollLast();
+                // pollLast(): removes AND returns the last element (oldest tweet ID). O(1).
+                // "poll" variant: returns null if empty (vs removeLast() which throws exception).
+                // We use pollLast (not removeLast) for safety even though we checked size.
+            }
+            tweetIds.addFirst(tweetId);
+            // addFirst(): adds element at the HEAD of the deque (index 0). O(1).
+            // Newest tweet â†’ front. Iteration order: newest-first (what users expect).
+        } finally {
+            writeLock.unlock();
+            // ALWAYS unlock in finally block!
+            // If an exception is thrown inside try: finally still executes.
+            // Without finally: exception â†’ lock never released â†’ all subsequent requests DEADLOCK.
+        }
+    }
+
+    /** Get up to `limit` tweet IDs, newest first. */
+    public List<String> getRecentIds(int limit) {
+        readLock.lock();    // Acquire SHARED read lock. Other readers can also hold this simultaneously.
+        try {
+            // Create a snapshot copy while holding the lock.
+            // IMPORTANT: we return a new ArrayList, not a view of tweetIds.
+            // If we returned a live view, callers could iterate while another thread modifies.
+            // A snapshot copy is safe to use after releasing the lock.
+            return tweetIds.stream()
+                    .limit(limit)
+                    // Stream.limit(n): short-circuit â€” produces at most n elements.
+                    // Does NOT process the whole deque. O(limit) not O(size).
+                    .collect(Collectors.toList());
+                    // Collectors.toList(): collects stream into a new ArrayList. O(limit).
+        } finally {
+            readLock.unlock();  // Release shared lock â€” other waiting writers can now proceed.
+        }
+    }
+
+    public int size() {
+        readLock.lock();
+        try { return tweetIds.size(); }
+        finally { readLock.unlock(); }
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// FANOUT SERVICE  (the heart of Twitter's write path)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class FanoutService {
+    // One Timeline per user, keyed by userId.
+    // ConcurrentHashMap: allows concurrent reads/writes without a global lock.
+    // vs synchronized HashMap: ONE global lock â†’ massive contention. ConcurrentHashMap: 16 stripes.
+    private final ConcurrentHashMap<String, Timeline> timelines = new ConcurrentHashMap<>();
+
+    private static final int MAX_TIMELINE_SIZE = 5_000;  // Twitter's Redis timeline limit
+
+    // computeIfAbsent: ATOMIC get-or-create.
+    // WHY NOT: if(!timelines.containsKey(k)) timelines.put(k, new Timeline()) ?
+    //   Thread A: containsKey â†’ false (doesn't exist yet)
+    //   Thread B: containsKey â†’ false (also doesn't exist)
+    //   Thread A: put(k, new Timeline())
+    //   Thread B: put(k, new Timeline()) â† OVERWRITES A's timeline! Data loss!
+    //
+    // computeIfAbsent(key, mappingFunction):
+    //   If key absent: atomically computes value using function, inserts, returns new value.
+    //   If key present: returns existing value WITHOUT calling the function.
+    //   The compute-and-insert operation is ATOMIC for ConcurrentHashMap.
+    private Timeline getTimeline(String userId) {
+        return timelines.computeIfAbsent(userId, k -> new Timeline(MAX_TIMELINE_SIZE));
+        // Lambda `k -> new Timeline(...)` is the mapping function.
+        // k = the key (userId). Ignored here, but available if needed (e.g., for logging).
+    }
+
+    public void addToOwnTimeline(String userId, String tweetId) {
+        getTimeline(userId).addTweetId(tweetId);
+    }
+
+    /**
+     * PUSH fanout: write tweetId to all followers' timelines immediately.
+     * In production: this runs inside a Kafka consumer (async, not blocking tweet creation).
+     * For normal users: push is fine. For celebrities (100M followers): skip push, use pull.
+     */
+    public int fanoutPush(String tweetId, Set<String> followerIds) {
+        int count = 0;
+        for (String followerId : followerIds) {
+            getTimeline(followerId).addTweetId(tweetId);
+            count++;
+        }
+        // In production: parallelize using ExecutorService.invokeAll() or CompletableFuture.
+        // Parallel fanout for 100K followers: 10 threads Ã— 10K timelines/thread = 10K faster.
+        return count;
+    }
+
+    /** Get a user's pre-built timeline, newest first. Already sorted â€” O(1) reads. */
+    public List<String> getTimeline(String userId, int limit) {
+        Timeline tl = timelines.get(userId);
+        if (tl == null) return List.of();
+        // List.of(): returns an immutable empty list (Java 9+). More efficient than new ArrayList<>().
+        // Java 9 factory methods: List.of(), Map.of(), Set.of() create immutable collections.
+        return tl.getRecentIds(limit);
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TRENDING SERVICE  (sliding window hashtag counter)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TrendingService {
+    // Map: hashtag â†’ deque of timestamps when that hashtag was used.
+    // ArrayDeque is used as a sliding window (add newest at right, evict oldest from left).
+    private final ConcurrentHashMap<String, ArrayDeque<Instant>> tagTimestamps
+            = new ConcurrentHashMap<>();
+
+    private final Duration windowSize = Duration.ofHours(1);  // 1-hour sliding window
+    private static final int TOP_K   = 10;
+
+    // One global ReentrantLock (vs one lock per tag).
+    // Choice: global lock simpler; per-tag lock more concurrent.
+    // For trending, writes are infrequent â€” global lock is fine.
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public void record(String hashtag, Instant timestamp) {
+        // computeIfAbsent: safely get-or-create the deque for this hashtag.
+        ArrayDeque<Instant> times =
+            tagTimestamps.computeIfAbsent(hashtag, k -> new ArrayDeque<>());
+
+        lock.lock();
+        try {
+            times.addLast(timestamp);      // Add new event at the tail (newest end). O(1).
+            Instant cutoff = timestamp.minus(windowSize);
+            // Instant.minus(Duration): returns a NEW Instant (Instant is immutable).
+            // cutoff = "1 hour ago from this timestamp"
+            // Evict timestamps older than the window:
+            while (!times.isEmpty() && times.peekFirst().isBefore(cutoff)) {
+                // peekFirst(): look at head without removing. Returns null if empty (hence isEmpty check).
+                // isBefore(cutoff): is the oldest event before our window? If yes, remove it.
+                times.pollFirst();  // Remove oldest. O(1) for ArrayDeque.
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Get top-K hashtags by event count in the last hour. */
+    public List<Map.Entry<String, Integer>> getTopK() {
+        lock.lock();
+        try {
+            Instant cutoff = Instant.now().minus(windowSize);
+
+            // Build count map: for each tag, count events within the window.
+            Map<String, Integer> counts = new HashMap<>();
+            tagTimestamps.forEach((tag, times) -> {
+                // Map.forEach: iterates all (key, value) pairs. Lambda receives (tag, times).
+                int count = (int) times.stream()
+                        .filter(ts -> !ts.isBefore(cutoff))
+                        // filter: keep only timestamps WITHIN the window (not before cutoff).
+                        // ts.isBefore(cutoff) â†’ true if ts is older than cutoff.
+                        // Negating: !ts.isBefore = ts is within the window.
+                        .count();
+                        // Stream.count(): long (not int). We cast to int (safe for counts < 2B).
+                if (count > 0) counts.put(tag, count);
+            });
+
+            // Sort by count descending, take top-K.
+            return counts.entrySet().stream()
+                    // entrySet().stream(): stream of Map.Entry<String, Integer> objects.
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    // Map.Entry.comparingByValue(): Comparator comparing entries by value (count).
+                    // The <String, Integer> type witness is needed because Java can't always infer it.
+                    // .reversed(): flips Comparator to descending (highest count first).
+                    .limit(TOP_K)
+                    .collect(Collectors.toList());
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// NOTIFICATION SERVICE
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// record: Java 16+ immutable value type.
+// Automatically generates: constructor, getters, equals(), hashCode(), toString().
+// No boilerplate! Immutable by default (all fields final).
+record Notification(
+    String    recipientId,
+    String    senderId,
+    NotifType type,
+    String    tweetId,     // null if not tweet-related
+    String    message,
+    Instant   createdAt
+) {
+    // Custom compact constructor (validates fields before assignment):
+    Notification {
+        Objects.requireNonNull(recipientId, "recipientId required");
+        Objects.requireNonNull(message,     "message required");
+        // Other fields are allowed to be null (tweetId may be null for follow notifications).
+    }
+}
+
+class NotificationService {
+    // Per-user inbox: userId â†’ list of notifications (newest first).
+    private final ConcurrentHashMap<String, LinkedList<Notification>> inboxes
+            = new ConcurrentHashMap<>();
+    // LinkedList: O(1) addFirst() and removeLast(). Good for bounded queue with prepend.
+    // vs ArrayList: ArrayList.add(0, x) is O(n) â€” shifts all elements right. Slow for large inboxes.
+
+    // Per-user lock (finer granularity than one global lock).
+    // WHY finer granularity?
+    //   One global lock: Alice reading her notifications BLOCKS Bob from reading his. Unnecessary.
+    //   Per-user lock: Alice's lock and Bob's lock are INDEPENDENT. Both proceed concurrently.
+    //   This is the "lock striping" pattern â€” the same idea ConcurrentHashMap uses internally.
+    private final ConcurrentHashMap<String, ReentrantLock> userLocks = new ConcurrentHashMap<>();
+
+    private ReentrantLock getLock(String userId) {
+        return userLocks.computeIfAbsent(userId, k -> new ReentrantLock());
+        // computeIfAbsent: atomically creates a new lock for a new user. Thread-safe.
+    }
+
+    /** Deliver a notification to a user's inbox. Keeps inbox bounded at 100 entries. */
+    public void notify(String recipientId, String senderId, NotifType type,
+                       String tweetId, String message) {
+        Notification notif = new Notification(recipientId, senderId, type,
+                                              tweetId, message, Instant.now());
+
+        LinkedList<Notification> inbox =
+            inboxes.computeIfAbsent(recipientId, k -> new LinkedList<>());
+
+        ReentrantLock lock = getLock(recipientId);
+        lock.lock();
+        try {
+            inbox.addFirst(notif);   // O(1) for LinkedList. Adds at head â†’ newest first.
+            // Bound inbox size (prevent unbounded memory growth):
+            if (inbox.size() > 100) inbox.removeLast();
+            // removeLast(): O(1) for LinkedList. Removes oldest notification.
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public List<Notification> get(String userId, int limit) {
+        LinkedList<Notification> inbox = inboxes.getOrDefault(userId, new LinkedList<>());
+        // getOrDefault(key, default): returns the default if key not found (avoids null check).
+        ReentrantLock lock = getLock(userId);
+        lock.lock();
+        try {
+            return inbox.stream().limit(limit).collect(Collectors.toList());
+            // Returns a COPY (snapshot). Caller can use this list after lock is released.
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public long unreadCount(String userId) {
+        LinkedList<Notification> inbox = inboxes.getOrDefault(userId, new LinkedList<>());
+        ReentrantLock lock = getLock(userId);
+        lock.lock();
+        try {
+            return inbox.stream().filter(n -> !n.type().equals(NotifType.MENTION)).count();
+            // n.type(): record getter (auto-generated). Equivalent to n.getType() in regular class.
+            // Using MENTION as always-unread example. Real: store isRead in a separate structure.
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TWEET REPOSITORY  (in-memory; production: Cassandra or MySQL)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TweetRepository {
+    private final ConcurrentHashMap<String, Tweet> store = new ConcurrentHashMap<>();
+    // tweetId â†’ Tweet. ConcurrentHashMap: O(1) get/put with thread safety.
+    // In production: this is replaced by a Cassandra DAO or JPA repository.
+    // The interface (save/findById/findByUser) stays the same â†’ Dependency Inversion.
+
+    public void save(Tweet tweet) {
+        store.put(tweet.getId(), tweet);
+        // ConcurrentHashMap.put(): thread-safe O(1) amortized. No lock needed at call site.
+    }
+
+    /**
+     * Find tweet by ID. Returns Optional to force callers to handle the "not found" case.
+     * WHY Optional instead of returning null?
+     *   Returning null: caller might forget to null-check â†’ NullPointerException at runtime.
+     *   Optional: compiler enforces handling. Must call .isPresent(), .orElse(), or .ifPresent().
+     *   Makes the "may be absent" contract part of the method signature â€” self-documenting.
+     */
+    public Optional<Tweet> findById(String id) {
+        return Optional.ofNullable(store.get(id));
+        // Optional.ofNullable(x): if x==null â†’ Optional.empty(), else â†’ Optional.of(x).
+        // Wraps potentially-null result safely.
+    }
+
+    /** Get a user's tweets, newest first, filtered to visible (not deleted). */
+    public List<Tweet> findByUser(String authorId, int limit) {
+        return store.values().stream()
+                // store.values(): Collection<Tweet> â€” all tweets (unordered).
+                .filter(t -> t.getAuthorId().equals(authorId))
+                // filter: keep only this author's tweets.
+                .filter(Tweet::isVisible)
+                // Method reference Tweet::isVisible is equivalent to: t -> t.isVisible()
+                // More concise; compiler infers the instance method call on each stream element.
+                .sorted(Comparator.comparing(Tweet::getCreatedAt).reversed())
+                // Comparator.comparing(keyExtractor): compare tweets by createdAt.
+                // .reversed(): flip to descending (newest first).
+                .limit(limit)
+                .collect(Collectors.toList());
+    }
+
+    /** Search all visible tweets containing the given hashtag (case-insensitive). */
+    public List<Tweet> searchByHashtag(String hashtag) {
+        String tag = hashtag.replaceFirst("^#", "").toLowerCase();
+        // replaceFirst("^#", ""): remove leading '#' if present.
+        // "^#" = regex: '#' anchored at the start (^) of the string.
+        // replaceFirst replaces only the FIRST match (there's only one '^' position).
+
+        return store.values().stream()
+                .filter(Tweet::isVisible)
+                .filter(t -> t.getHashtags().contains(tag))
+                .sorted(Comparator.comparing(Tweet::getCreatedAt).reversed())
+                .collect(Collectors.toList());
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TWITTER SERVICE  (Facade â€” single entry point for all operations)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TwitterService {
+    // username (lowercase) â†’ User
+    private final ConcurrentHashMap<String, User> users     = new ConcurrentHashMap<>();
+    private final TweetRepository                  tweetRepo = new TweetRepository();
+    private final FanoutService                    fanout    = new FanoutService();
+    private final TrendingService                  trending  = new TrendingService();
+    private final NotificationService              notifs    = new NotificationService();
+
+    public User registerUser(String username, String displayName) {
+        User user = new User(username, displayName);
+        User existing = users.putIfAbsent(username.toLowerCase(), user);
+        // putIfAbsent(key, value):
+        //   If key NOT present: insert (key, value) atomically, return null.
+        //   If key PRESENT: do NOT insert, return the existing value.
+        // ATOMIC: two threads calling putIfAbsent with same key â€” only ONE succeeds.
+        if (existing != null)
+            throw new IllegalArgumentException("@" + username + " is already taken");
+        System.out.println("Registered: @" + user.getUsername());
+        return user;
+    }
+
+    /**
+     * Post a tweet. Full flow:
+     * 1. Validate + create  2. Save  3. Own timeline  4. Fan-out
+     * 5. Trending hashtags  6. Mention notifications  7. Reply notification
+     */
+    public Tweet post(User author, String text, String replyToId) {
+        TweetType type = (replyToId == null) ? TweetType.ORIGINAL : TweetType.REPLY;
+        Tweet tweet = new Tweet(author.getId(), text, type, replyToId);
+
+        tweetRepo.save(tweet);
+        fanout.addToOwnTimeline(author.getId(), tweet.getId());
+
+        if (!author.isCelebrity()) {
+            int pushed = fanout.fanoutPush(tweet.getId(), author.getFollowerIds());
+            System.out.printf("Pushed to %d followers%n", pushed);
+        } else {
+            System.out.printf("Celebrity @%s â€” followers pull on read%n", author.getUsername());
+        }
+
+        // Record hashtags for trending (use tweet's createdAt as event timestamp):
+        tweet.getHashtags().forEach(tag -> trending.record(tag, tweet.getCreatedAt()));
+
+        // Notify @mentions:
+        tweet.getMentions().forEach(mentionedHandle -> {
+            // forEach on List<String>: runs lambda for each element. Cleaner than for-loop.
+            User mentioned = users.get(mentionedHandle);
+            if (mentioned != null && !mentioned.getId().equals(author.getId())) {
+                notifs.notify(mentioned.getId(), author.getId(), NotifType.MENTION,
+                        tweet.getId(), "@" + author.getUsername() + " mentioned you");
+            }
+        });
+
+        // Notify reply target:
+        if (replyToId != null) {
+            tweetRepo.findById(replyToId).ifPresent(parent -> {
+                // Optional.ifPresent(consumer): run lambda ONLY if Optional has a value.
+                // If parent tweet was deleted (empty Optional): this block is skipped. Null-safe.
+                parent.incrementReply();
+                notifs.notify(parent.getAuthorId(), author.getId(), NotifType.REPLY,
+                        tweet.getId(), "@" + author.getUsername() + " replied to your tweet");
+            });
+        }
+
+        return tweet;
+    }
+
+    public Tweet retweet(User user, Tweet original, String comment) {
+        boolean isQuote = !comment.isBlank();
+        // String.isBlank(): true if string is null, empty, or contains only whitespace (Java 11+).
+        String rtText = isQuote
+                ? comment + "\nRT: " + original.getText().substring(0, Math.min(200, original.getText().length()))
+                : "RT @" + lookupUsername(original.getAuthorId()) + ": " + original.getText();
+        // Math.min(a, b): returns the smaller of a and b. Prevents StringIndexOutOfBoundsException.
+        // Ternary operator (condition ? a : b): inline if-else. Assigns rtText in one expression.
+
+        Tweet rt = new Tweet(user.getId(), rtText,
+                isQuote ? TweetType.QUOTE_TWEET : TweetType.RETWEET, original.getId());
+        original.incrementRetweet();
+        tweetRepo.save(rt);
+        fanout.addToOwnTimeline(user.getId(), rt.getId());
+        fanout.fanoutPush(rt.getId(), user.getFollowerIds());
+        notifs.notify(original.getAuthorId(), user.getId(), NotifType.RETWEET,
+                original.getId(), "@" + user.getUsername() + " retweeted your tweet");
+        return rt;
+    }
+
+    public boolean like(User user, Tweet tweet) {
+        boolean liked = tweet.like(user.getId());
+        if (liked && !tweet.getAuthorId().equals(user.getId())) {
+            notifs.notify(tweet.getAuthorId(), user.getId(), NotifType.LIKE,
+                    tweet.getId(), "@" + user.getUsername() + " liked your tweet");
+        }
+        return liked;
+    }
+
+    public boolean follow(User follower, User target) {
+        boolean success = follower.follow(target);
+        if (success) {
+            notifs.notify(target.getId(), follower.getId(), NotifType.NEW_FOLLOWER,
+                    null, "@" + follower.getUsername() + " followed you");
+        }
+        return success;
+    }
+
+    /** Build home timeline by looking up tweets from the fanout-built ID list. */
+    public List<Tweet> getHomeTimeline(User user, int limit) {
+        return fanout.getTimeline(user.getId(), limit).stream()
+                .map(tweetRepo::findById)
+                // map(tweetRepo::findById): transforms each String ID â†’ Optional<Tweet>.
+                // Method reference on instance: tweetRepo::findById â‰¡ id -> tweetRepo.findById(id).
+                .filter(Optional::isPresent)
+                // Static method reference on Optional class: opt -> opt.isPresent().
+                // Filters out empty Optionals (deleted tweets whose IDs are still in timeline).
+                .map(Optional::get)
+                // Optional::get: unwraps Optional â†’ Tweet. Safe because we filtered empties above.
+                .collect(Collectors.toList());
+    }
+
+    public List<Tweet> getProfileTweets(User user, int limit) {
+        return tweetRepo.findByUser(user.getId(), limit);
+    }
+
+    public List<Map.Entry<String, Integer>> getTrending() {
+        return trending.getTopK();
+    }
+
+    public List<Notification> getNotifications(User user, int limit) {
+        return notifs.get(user.getId(), limit);
+    }
+
+    private String lookupUsername(String userId) {
+        return users.values().stream()
+                .filter(u -> u.getId().equals(userId))
+                .map(User::getUsername)
+                // Method reference on instance method: u -> u.getUsername()
+                .findFirst()
+                // findFirst(): terminal op. Returns Optional<String> (first matching element, or empty).
+                .orElse("unknown");
+                // orElse(default): if Optional is empty â†’ return default. If present â†’ return value.
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// DEMO  (mirrors the Python demo section exactly)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TwitterJavaDemo {
+    public static void main(String[] args) {
+        TwitterService twitter = new TwitterService();
+
+        User elon   = twitter.registerUser("elonmusk",   "Elon Musk");
+        User sachin = twitter.registerUser("sachin_dev",  "Sachin Kumar");
+        User priya  = twitter.registerUser("priya_coder", "Priya Sharma");
+
+        System.out.println("\n=== FOLLOW ===");
+        twitter.follow(sachin, elon);
+        twitter.follow(priya,  elon);
+        twitter.follow(sachin, priya);
+        twitter.follow(priya,  sachin);
+
+        System.out.println("\n=== TWEETS ===");
+        Tweet t1 = twitter.post(elon,   "Shipped AI model! X is the future. #AI #Tech", null);
+        Tweet t2 = twitter.post(sachin, "Cracked #LLD at Amazon! @priya_coder helped me!", null);
+        Tweet t3 = twitter.post(priya,  "Congrats @sachin_dev! #LLD is key!", null);
+
+        System.out.println("\n=== REPLY + LIKES ===");
+        twitter.post(sachin, "What context window? @elonmusk", t1.getId());
+        twitter.like(priya, t2);
+        twitter.like(elon,  t2);
+        System.out.printf("t2 likes: %d%n", t2.getLikeCount());
+
+        System.out.println("\n=== RETWEET ===");
+        twitter.retweet(priya, t2, "Must read for LLD prep!");
+
+        System.out.println("\n=== SACHIN HOME TIMELINE ===");
+        twitter.getHomeTimeline(sachin, 5).forEach(t ->
+            System.out.printf("  %s: %s%n",
+                t.getAuthorId().substring(0, 8),
+                t.getText().substring(0, Math.min(50, t.getText().length()))));
+
+        System.out.println("\n=== TRENDING ===");
+        twitter.getTrending().forEach(e ->
+            System.out.printf("  #%s: %d tweets%n", e.getKey(), e.getValue()));
+
+        System.out.println("\n=== SACHIN NOTIFICATIONS ===");
+        twitter.getNotifications(sachin, 5).forEach(n ->
+            System.out.printf("  [%s] %s%n", n.type(), n.message()));
+
+        System.out.println("\n=== HASHTAG SEARCH #LLD ===");
+        List<Tweet> lldTweets = new TweetRepository().searchByHashtag("#LLD");
+        System.out.printf("Found %d #LLD tweets (from repo directly)%n", lldTweets.size());
+    }
+}
+```
+
+---

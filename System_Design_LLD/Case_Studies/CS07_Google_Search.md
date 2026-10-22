@@ -1229,3 +1229,888 @@ A:
   
   Updated: globally every hour (new popular queries), personalized real-time.
 ```
+
+
+---
+
+## STEP 8 — Extended Deep-Dives: Advanced Design Patterns in Practice
+
+```
+CONCURRENT ACCESS PATTERNS — THE SUBTLETIES:
+
+  WHY ConcurrentHashMap.newKeySet() in Java:
+    Set<String> followers = new HashSet<>();  // NOT thread-safe
+    Thread A: followers.add("alice");
+    Thread B: followers.add("bob");
+    Result: potential data corruption. HashSet.add() is NOT atomic.
+    
+    Set<String> followers = ConcurrentHashMap.newKeySet();  // thread-safe
+    Internally: ConcurrentHashMap<String, Boolean>. All operations atomic.
+    Why not Collections.synchronizedSet()?
+      synchronizedSet wraps with synchronized block.
+      add() and remove(): one thread at a time. Works but LOW THROUGHPUT.
+      ConcurrentHashMap.newKeySet(): lock-free reads via CAS (Compare-And-Swap).
+      Much higher throughput for read-heavy access (followers list is read very often).
+  
+  THE READ-WRITE LOCK PATTERN (Java ReentrantReadWriteLock):
+    Scenario: followers list accessed thousands of times per second for reads.
+    Writing (follow/unfollow): rare (maybe 100 times/day for average user).
+    
+    synchronized(lock): allows ONLY ONE thread at a time — both reads AND writes exclusive.
+    ReadWriteLock: multiple readers simultaneously. Only one writer at a time.
+    
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    // Read: acquire read lock (multiple threads can hold read lock simultaneously)
+    public int getFollowerCount() {
+        lock.readLock().lock();
+        try {
+            return followers.size();  // can be read by 1000 threads simultaneously
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    // Write: acquire write lock (exclusive — waits for all readers to finish)
+    public boolean follow(User target) {
+        lock.writeLock().lock();
+        try {
+            return following.add(target.getId());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    Performance gain: 100× read throughput vs plain synchronized.
+    Read-heavy workload (99% reads, 1% writes) → ReadWriteLock is dramatically faster.
+    
+    When NOT to use ReadWriteLock:
+      Write-heavy workloads: write lock contention → worse than synchronized.
+      Very short critical sections: overhead of RWLock > benefit.
+      Rule of thumb: reads > 10× writes → ReadWriteLock wins.
+
+ATOMIC OPERATIONS IN JAVA — WHEN TO USE WHAT:
+  
+  AtomicInteger vs volatile vs synchronized:
+  
+  volatile int counter = 0;
+  counter++;  // NOT thread-safe! Three operations: read, increment, write.
+  // Thread A reads 5, Thread B reads 5, A writes 6, B writes 6. Incremented ONCE. Wrong.
+  
+  AtomicInteger counter = new AtomicInteger(0);
+  counter.incrementAndGet();  // THREAD-SAFE. Single atomic hardware instruction (LOCK ADD).
+  
+  int count = counter.get();  // Thread-safe read.
+  counter.compareAndSet(expected, newValue);  // CAS: only updates if current == expected.
+  
+  When to use AtomicInteger:
+    Single-field counter that only increments/decrements.
+    Like: clickCount, likeCount, retryCount.
+  
+  When AtomicInteger is NOT enough:
+    Need to update TWO related fields atomically.
+    E.g., "transfer $100: decrease account A, increase account B" — need synchronized.
+    AtomicInteger: each field is atomic, but the COMBINATION isn't. Race condition possible.
+    Fix: synchronized block covering BOTH updates, or compare-and-swap loop.
+
+IMMUTABILITY AS A CONCURRENCY TOOL:
+  
+  Location is a frozen dataclass (Python) / Java record.
+  Immutable = no setters = shared freely between threads without locking.
+  
+  Why immutability is the BEST concurrency solution:
+    No mutation → no race condition possible → no locks needed → faster.
+  
+  Make as many objects immutable as possible:
+    All "value objects" (Location, MediaMeta, UrlEntry): immutable. ✓
+    All "service objects" (UrlShortener, FeedService): mutable (have state). Use locks.
+  
+  In Java: use records (Java 16+) for immutable value objects.
+  In C++: use const member variables + no setters.
+  In Python: use @dataclass(frozen=True).
+```
+
+---
+
+## STEP 9 — System Design Upgrade Paths
+
+```
+HOW THIS LLD EVOLVES TO PRODUCTION:
+
+LEVEL 1: Single Process (current LLD)
+  InMemoryRepository: dict in RAM.
+  LRUCache: OrderedDict in process.
+  Single thread or very limited concurrency.
+  Scale: up to 100K entries. Suitable for demo.
+
+LEVEL 2: Single Machine, Multiple Threads
+  Replace dict with PostgreSQL + connection pool (psycopg2/asyncpg).
+  Replace LRUCache with Redis (redisio library).
+  Uvicorn/Gunicorn: 4 workers × 8 threads = 32 concurrent request handlers.
+  Scale: millions of entries, thousands requests/sec.
+  Code change: only change what gets INJECTED (Strategy Pattern saves us).
+    repo = PostgresUrlRepository(db_pool)  # one line change
+    cache = RedisCacheLayer(redis_client)  # one line change
+    shortener = UrlShortener(repo, cache)  # zero changes to this class
+
+LEVEL 3: Multi-Machine (Microservices)
+  UrlShortener → ShortenService (containerized, stateless, scale horizontally).
+  RedirectService → RedirectService (separate container, optimized for reads).
+  PostgreSQL → PostgreSQL cluster (1 primary + 3 read replicas + Pgpool-II load balancer).
+  Redis → Redis Cluster (6 nodes, 3 primary + 3 replica).
+  API Gateway → Kong (handles auth, rate limiting, routing).
+  Scale: millions of requests/sec. 99.99% availability.
+
+LEVEL 4: Global Scale (bit.ly / TinyURL scale)
+  Database → sharded PostgreSQL (10 shards × consistent hashing).
+  CDN → Cloudflare (redirects served at CDN edge, < 5ms globally).
+  Analytics → ClickHouse (50B click events/day, < 1s aggregation queries).
+  Multi-region → US + EU + APAC (3 regions × full stack).
+  Scale: 100M URLs, 10B redirects/day. < 10ms p99 globally.
+  Code changes: none to core business logic. Only infra config changes.
+  The LLD design held up to 100,000× scale increase. This is the power of good OOP design.
+
+INTERVIEW TIP — HOW TO TRANSITION FROM LLD TO HLD:
+  After showing LLD code, interviewer asks "how would this scale?"
+  
+  1. Identify the bottleneck (InMemoryRepository can't handle 578K reads/sec).
+  2. Replace the specific component (not the entire system):
+     "I'd replace InMemoryUrlRepository with a sharded PostgreSQL repository.
+     The IUrlRepository interface means UrlShortener doesn't change at all."
+  3. Discuss the HLD implications (sharding, caching, CDN) in terms of your LLD design.
+  4. Show you understand the PROGRESSION from clean OOP to distributed systems.
+  
+  This answer demonstrates: LLD mastery + HLD thinking + evolutionary design mindset.
+  MAANG interviewers specifically look for this progression.
+```
+
+
+---
+
+## STEP 4 â€” Java Implementation (Full â€” Every Line Explained)
+
+> **Enhanced Java section**: Complete, production-quality implementation matching Python depth. Every data structure, lock, and design pattern is annotated.
+
+```java
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Google Search Engine â€” Full Java LLD (every line explained)
+//
+// Java vs Python highlights:
+//   â— PriorityQueue<T>  â€” O(log n) min-heap for URL frontier priority queue
+//   â— ConcurrentHashMap â€” lock-striped thread-safe map for inverted index
+//   â— ReentrantReadWriteLock â€” concurrent readers / exclusive writer
+//   â— AtomicLong        â€” thread-safe document count / URL counter
+//   â— record (Java 16+) â€” immutable value types (Document, SearchResult)
+//   â— Stream API        â€” functional pipeline replaces Python comprehensions
+//   â— TreeMap           â€” sorted map for posting list merges
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+import java.util.stream.*;
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ENUMS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+enum CrawlPriority { HIGH, MEDIUM, LOW }
+// HIGH:   news sites, frequently changing pages (re-crawl every hour)
+// MEDIUM: standard websites (re-crawl weekly)
+// LOW:    rarely-updated long-tail pages (re-crawl monthly)
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// DOMAIN MODELS â€” Immutable records (Java 16+)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * A URL waiting to be crawled.
+ * WHY record? URL metadata is a pure value (no behavior beyond holding data).
+ * record auto-generates: constructor, getters, equals/hashCode/toString.
+ * Immutable by default â€” no thread-safety concerns when shared across threads.
+ */
+record CrawlUrl(
+    String url,
+    int    priority,   // Lower = higher priority (min-heap convention)
+    int    depth,      // Hops from a seed URL (controls crawl depth limit)
+    Instant discoveredAt
+) implements Comparable<CrawlUrl> {
+
+    // Compact constructor: validate fields before assignment (no `this.field =` needed in record)
+    CrawlUrl {
+        Objects.requireNonNull(url, "URL cannot be null");
+        if (priority < 0) throw new IllegalArgumentException("Priority must be >= 0");
+    }
+
+    @Override
+    public int compareTo(CrawlUrl other) {
+        // PriorityQueue uses this to determine ordering.
+        // Integer.compare(a, b): returns negative if a < b, 0 if a==b, positive if a > b.
+        // Min-heap: smaller priority value = dequeued first = higher actual priority.
+        return Integer.compare(this.priority, other.priority);
+    }
+}
+
+/**
+ * A crawled and parsed web document.
+ * Immutable value type â€” safe to share between crawler, indexer, and ranker threads.
+ */
+record Document(
+    String        id,          // URL (also serves as unique document ID)
+    String        title,
+    String        body,        // Cleaned text content (HTML stripped)
+    List<String>  outboundLinks, // URLs found in <a href="..."> tags
+    double        pageRank,    // Computed PageRank score (updated periodically)
+    Instant       crawledAt
+) {
+    /** Parse whitespace-separated words from body, lowercase, min 3 chars. */
+    public List<String> tokens() {
+        if (body == null || body.isBlank()) return List.of();
+        // List.of(): immutable list factory (Java 9+). More efficient than new ArrayList<>().
+
+        return Arrays.stream(body.toLowerCase().split("\\W+"))
+        // "\\W+" = one or more non-word characters (spaces, punctuation, newlines).
+        // Equivalent to Python's re.split(r'\W+', body.lower()).
+                .filter(t -> t.length() >= 3)
+                // filter: keep only tokens with >= 3 characters (remove "a", "is", "of" noise).
+                .distinct()
+                // distinct(): removes duplicate tokens. Each term appears at most once per document.
+                // Uses Object.equals/hashCode internally. O(n) time with a LinkedHashSet.
+                .collect(Collectors.toUnmodifiableList());
+                // Collectors.toUnmodifiableList(): returns immutable list. Java 10+.
+    }
+
+    /** Compute TF (Term Frequency) for a given term in this document. */
+    public double tf(String term) {
+        if (body == null || body.isBlank()) return 0.0;
+        String[] words = body.toLowerCase().split("\\W+");
+        long termCount = Arrays.stream(words)
+                .filter(w -> w.equals(term))
+                // filter: count exact matches of the term.
+                .count();
+                // Stream.count(): terminal operation â€” returns long (count of matching elements).
+        return words.length == 0 ? 0.0 : (double) termCount / words.length;
+        // TF = (occurrences of term in doc) / (total tokens in doc).
+        // Cast termCount to double before division to avoid integer division truncation.
+    }
+}
+
+/**
+ * A single result returned to the user after search.
+ */
+record SearchResult(
+    String  url,
+    String  title,
+    String  snippet,   // ~150-char excerpt showing context around matched terms
+    double  score,     // Combined TF-IDF Ã— PageRank score
+    Instant crawledAt
+) implements Comparable<SearchResult> {
+
+    @Override
+    public int compareTo(SearchResult other) {
+        // Higher score = better result = should come FIRST.
+        // Double.compare(a, b): returns positive if a > b.
+        // Negating: reversed() for descending order in PriorityQueue (max-heap).
+        return Double.compare(other.score, this.score);
+        // Note: comparing other.score vs this.score (reversed) = descending natural order.
+    }
+}
+
+/**
+ * A posting: one document's TF-IDF relevance for a specific term.
+ * Stored in InvertedIndex posting lists.
+ */
+record Posting(String docId, double tfidf) implements Comparable<Posting> {
+    @Override
+    public int compareTo(Posting other) {
+        return Double.compare(other.tfidf, this.tfidf); // Descending: highest TF-IDF first
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// URL FRONTIER  (priority queue of URLs to crawl)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class UrlFrontier {
+    // PriorityQueue: min-heap. poll() returns the element with the LOWEST priority value.
+    // We assign lower numeric values to higher-priority URLs (news=1, standard=5, long-tail=10).
+    // Thread-safety: PriorityQueue is NOT thread-safe â†’ we wrap with synchronized methods.
+    //
+    // WHY NOT PriorityBlockingQueue?
+    //   PriorityBlockingQueue is thread-safe but has no built-in dedup.
+    //   We need to track visited URLs AND maintain ordering â†’ use synchronized PriorityQueue + HashSet.
+    private final PriorityQueue<CrawlUrl> queue   = new PriorityQueue<>();
+    private final Set<String>             visited = new HashSet<>();
+    // visited: tracks URLs we've already crawled or queued. Prevents re-crawling the same URL.
+    // HashSet: O(1) contains/add. NOT thread-safe (accessed only within synchronized blocks).
+
+    private final ReentrantLock lock = new ReentrantLock();
+    // ReentrantLock vs synchronized:
+    //   Both provide mutual exclusion (one thread at a time).
+    //   ReentrantLock: supports tryLock(timeout), lockInterruptibly(), fair ordering (optional).
+    //   synchronized: simpler syntax, JVM-optimized for low-contention cases.
+    //   Here: either works. ReentrantLock chosen for its explicit unlock-in-finally safety pattern.
+
+    /** Add URL to frontier if not already visited. Returns true if added. */
+    public boolean add(String url, int priority, int depth) {
+        lock.lock();
+        try {
+            if (visited.contains(url)) return false;  // Dedup: skip already-queued/crawled URLs
+            visited.add(url);
+            queue.offer(new CrawlUrl(url, priority, depth, Instant.now()));
+            // PriorityQueue.offer(element): insert into heap. O(log n) â€” heap re-orders.
+            // offer() never throws (unlike add() which throws if capacity exceeded in bounded queues).
+            // Our PriorityQueue is unbounded â†’ no capacity issue, but offer() is the safer idiom.
+            return true;
+        } finally {
+            lock.unlock();  // ALWAYS in finally â€” release lock even if exception is thrown
+        }
+    }
+
+    /** Get the next highest-priority URL to crawl. Returns null if frontier is empty. */
+    public CrawlUrl poll() {
+        lock.lock();
+        try {
+            return queue.poll();
+            // PriorityQueue.poll(): removes and returns the head (lowest priority value = highest priority URL).
+            // Returns null if queue is empty (does NOT throw â€” unlike remove() which throws).
+            // O(log n): after removal, heap re-orders to restore min-heap property.
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int size() {
+        lock.lock();
+        try { return queue.size(); }
+        finally { lock.unlock(); }
+    }
+
+    public boolean isEmpty() {
+        lock.lock();
+        try { return queue.isEmpty(); }
+        finally { lock.unlock(); }
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// INVERTED INDEX  (the core data structure of any search engine)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class InvertedIndex {
+    /**
+     * THE INVERTED INDEX:
+     * Maps each term â†’ sorted list of Postings (docId + TF-IDF score).
+     * "Inverted" because we invert the document-centric view:
+     *   Normal:   Document â†’ [terms in document]
+     *   Inverted: Term     â†’ [documents containing the term]
+     *
+     * Example:
+     *   "java" â†’ [(doc1, tfidf=0.8), (doc3, tfidf=0.5), (doc7, tfidf=0.2)]
+     *   "design" â†’ [(doc2, tfidf=0.9), (doc1, tfidf=0.6)]
+     *
+     * Query "java design" â†’ intersect posting lists â†’ rank by combined TF-IDF.
+     */
+    private final ConcurrentHashMap<String, List<Posting>> index = new ConcurrentHashMap<>();
+    // ConcurrentHashMap: allows concurrent reads (no lock) + lock-striped writes.
+    // Each term's posting list can be read by many query threads simultaneously.
+    // Adding a new term (new key): ConcurrentHashMap handles atomically.
+
+    private final ConcurrentHashMap<String, Document>     documents = new ConcurrentHashMap<>();
+    // Store full documents for snippet generation. Key: docId (= URL).
+
+    private final AtomicLong docCount = new AtomicLong(0);
+    // AtomicLong: thread-safe 64-bit counter. Incremented each time a new document is indexed.
+    // Used in IDF calculation: IDF = log(total_docs / docs_containing_term).
+    // AtomicLong.get(): single volatile read. AtomicLong.incrementAndGet(): single CAS instruction.
+
+    // Per-term lock for modifying posting lists (finer granularity than one global lock)
+    private final ConcurrentHashMap<String, ReentrantReadWriteLock> termLocks
+            = new ConcurrentHashMap<>();
+
+    private ReentrantReadWriteLock getLock(String term) {
+        return termLocks.computeIfAbsent(term, k -> new ReentrantReadWriteLock());
+        // computeIfAbsent: atomically create a new lock for a term if none exists.
+        // Multiple threads calling for the same new term â†’ only one lock is created.
+    }
+
+    /** Index a document: compute TF-IDF for each term and update posting lists. */
+    public void index(Document doc) {
+        documents.put(doc.id(), doc);
+        long n = docCount.incrementAndGet();
+        // incrementAndGet(): atomically adds 1 and returns the new value (new total doc count).
+        // Using this as N in IDF formula: IDF(t) = log(N / df(t)).
+
+        // Compute TF for each unique token in this document
+        List<String> tokens = doc.tokens();
+        for (String term : tokens) {
+            double tf = doc.tf(term);
+
+            // IDF approximation: use current docCount as N.
+            // In a real search engine: IDF is recomputed periodically in a background batch job.
+            // Here: approximate with current N (may be slightly inaccurate for early docs).
+            long df = getDocumentFrequency(term);  // How many docs already contain this term
+            // IDF = log((N + 1) / (df + 1)) â€” add 1 to avoid division by zero (Laplace smoothing)
+            double idf = Math.log((n + 1.0) / (df + 1.0));
+            // Math.log(): natural logarithm (base e). Both Python's math.log and Java's Math.log are base e.
+            double tfidf = tf * idf;
+
+            // Create the posting for this document
+            Posting posting = new Posting(doc.id(), tfidf);
+
+            // Update the posting list for this term (thread-safe write)
+            ReentrantReadWriteLock.WriteLock wl = getLock(term).writeLock();
+            wl.lock();
+            try {
+                // computeIfAbsent: get existing list or create new ArrayList for new term. Atomic.
+                List<Posting> postings = index.computeIfAbsent(term, k -> new ArrayList<>());
+                postings.add(posting);
+                // Keep posting list sorted: highest TF-IDF first (best documents for this term).
+                postings.sort(Comparator.naturalOrder());
+                // Comparator.naturalOrder(): uses Posting.compareTo() â†’ descending TF-IDF (as defined above).
+                // Sort is O(n log n). For large indexes: use SortedList or skip sort (merge at query time).
+            } finally {
+                wl.unlock();
+            }
+        }
+    }
+
+    /** Get posting list for a term (thread-safe read). */
+    public List<Posting> getPostings(String term) {
+        List<Posting> postings = index.get(term);
+        if (postings == null) return List.of();  // Term not in index â†’ empty list
+
+        ReentrantReadWriteLock.ReadLock rl = getLock(term).readLock();
+        rl.lock();
+        try {
+            return new ArrayList<>(postings);
+            // Return a COPY (defensive copy). Caller can iterate without holding the lock.
+            // If we returned the live list: caller iterates â†’ writer modifies â†’ ConcurrentModificationException.
+        } finally {
+            rl.unlock();
+        }
+    }
+
+    /** Get document by ID (for snippet generation). */
+    public Optional<Document> getDocument(String docId) {
+        return Optional.ofNullable(documents.get(docId));
+        // Optional.ofNullable: wraps the result, which may be null if doc not found.
+    }
+
+    public long getTotalDocs() {
+        return docCount.get();  // Volatile read â€” current total document count
+    }
+
+    /** How many documents in the index contain this term? (document frequency) */
+    private long getDocumentFrequency(String term) {
+        List<Posting> postings = index.get(term);
+        // Reading from ConcurrentHashMap without a lock: safe because ConcurrentHashMap
+        // guarantees that get() always returns a consistent (if potentially stale by a few ms) value.
+        return (postings == null) ? 0 : postings.size();
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// QUERY PROCESSOR  (parse + expand the search query)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class QueryProcessor {
+    /**
+     * Tokenize and clean a user's search query.
+     * Same preprocessing as document indexing â†’ tokens match index terms.
+     */
+    public List<String> tokenize(String query) {
+        if (query == null || query.isBlank()) return List.of();
+
+        return Arrays.stream(query.toLowerCase().trim().split("\\W+"))
+                .filter(t -> t.length() >= 2)  // Keep terms with >= 2 chars ("of" out, "go" in)
+                .distinct()                    // Deduplicate: "java java" â†’ ["java"]
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Build a query plan: which terms are MUST-HAVE vs SHOULD-HAVE.
+     * Simple version: all terms are MUST-HAVE (AND query).
+     * Real Google: complex boolean algebra + query expansion via synonym/spelling correction.
+     */
+    public Map<String, Boolean> buildQueryPlan(String query) {
+        // Map: term â†’ isMandatory (true = AND, false = OR/optional)
+        List<String> tokens = tokenize(query);
+        Map<String, Boolean> plan = new LinkedHashMap<>();
+        // LinkedHashMap: maintains insertion order (important for result display).
+        // vs HashMap: no ordering guarantee. vs TreeMap: alphabetical order (not what we want here).
+
+        for (String token : tokens) {
+            plan.put(token, true);  // All terms mandatory (AND semantics)
+        }
+        return plan;
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// SEARCH ENGINE  (facade orchestrating all components)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class SearchEngine {
+    private final InvertedIndex   invertedIndex  = new InvertedIndex();
+    private final UrlFrontier     frontier       = new UrlFrontier();
+    private final QueryProcessor  queryProcessor = new QueryProcessor();
+
+    // PageRank scores (computed externally via batch job â€” not in this LLD scope)
+    private final ConcurrentHashMap<String, Double> pageRankScores = new ConcurrentHashMap<>();
+
+    /**
+     * Index a web document. Called by the web crawler after parsing a page.
+     * Thread-safe: InvertedIndex handles concurrent indexing.
+     */
+    public void indexDocument(Document doc) {
+        invertedIndex.index(doc);
+        pageRankScores.putIfAbsent(doc.id(), 1.0);
+        // putIfAbsent: insert default PageRank of 1.0 if this docId not yet ranked.
+        // "putIfAbsent" vs "put": doesn't overwrite if a real PageRank was already assigned.
+    }
+
+    /**
+     * Execute a search query. Returns top-K results ranked by TF-IDF Ã— PageRank.
+     *
+     * ALGORITHM:
+     * 1. Tokenize query: "java design patterns" â†’ ["java", "design", "patterns"]
+     * 2. For each term: get posting list (docId â†’ TF-IDF)
+     * 3. AND semantics: keep only docs that appear in ALL posting lists
+     * 4. Score: TF-IDF (sum of all terms) Ã— PageRank
+     * 5. Sort by score descending, return top-K
+     */
+    public List<SearchResult> search(String query, int topK) {
+        List<String> terms = queryProcessor.tokenize(query);
+        if (terms.isEmpty()) return List.of();
+
+        // â”€â”€ Step 1: Get posting lists for all query terms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        Map<String, List<Posting>> termPostings = new HashMap<>();
+        for (String term : terms) {
+            List<Posting> postings = invertedIndex.getPostings(term);
+            if (postings.isEmpty()) {
+                // If ANY term has zero results â†’ AND query returns no results.
+                // Real Google: fall back to OR semantics. We keep it simple here.
+                return List.of();
+            }
+            termPostings.put(term, postings);
+        }
+
+        // â”€â”€ Step 2: AND intersection â€” find docs present in ALL posting lists â”€
+        // Start with the smallest posting list (optimization: fewer docs to intersect against).
+        List<Posting> smallest = termPostings.values().stream()
+                .min(Comparator.comparingInt(List::size))
+                // Comparator.comparingInt(List::size): compare posting lists by their size.
+                // List::size is a method reference: l -> l.size().
+                // min(): returns Optional<List<Posting>> of the smallest list.
+                .orElse(List.of());
+                // orElse: return empty list if stream was empty (shouldn't happen â€” checked above).
+
+        // docId â†’ cumulative TF-IDF across all query terms
+        Map<String, Double> docScores = new HashMap<>();
+
+        for (Posting p : smallest) {
+            // Check if this doc appears in ALL other posting lists
+            boolean inAll = termPostings.entrySet().stream()
+                    // Stream over (term, postingList) pairs
+                    .filter(e -> !e.getKey().equals(terms.get(0)))
+                    // Skip the first term's list (we're already iterating it)
+                    .allMatch(e -> e.getValue().stream().anyMatch(op -> op.docId().equals(p.docId())));
+                    // allMatch: true if ALL posting lists contain a Posting with this docId.
+                    // anyMatch: true if at least one Posting in the list has the matching docId.
+                    // Nested streams: O(numTerms Ã— postingListSize). In production: use sorted merge.
+
+            if (inAll) {
+                // Sum TF-IDF across all terms for this document
+                double totalTfIdf = termPostings.values().stream()
+                        .flatMap(List::stream)
+                        // flatMap: flatten List<List<Posting>> â†’ Stream<Posting>
+                        // List::stream is a method reference: list -> list.stream()
+                        .filter(op -> op.docId().equals(p.docId()))
+                        .mapToDouble(Posting::tfidf)
+                        // mapToDouble: transform Posting â†’ double (extracts tfidf field).
+                        // Returns DoubleStream (specialized, avoids boxing to Double objects).
+                        .sum();
+                        // DoubleStream.sum(): sum all double values. Terminal operation.
+                docScores.put(p.docId(), totalTfIdf);
+            }
+        }
+
+        // â”€â”€ Step 3: Multiply by PageRank and build SearchResult objects â”€â”€â”€â”€
+        // PriorityQueue as a max-heap for top-K extraction.
+        // We want the K HIGHEST scores. Use min-heap of size K: evict the smallest if over K.
+        PriorityQueue<SearchResult> topKHeap = new PriorityQueue<>(topK + 1, Comparator.naturalOrder());
+        // PriorityQueue(capacity, comparator): initial capacity + ordering.
+        // Comparator.naturalOrder() uses SearchResult.compareTo() â†’ descending score.
+
+        for (Map.Entry<String, Double> entry : docScores.entrySet()) {
+            String docId     = entry.getKey();
+            double tfidf     = entry.getValue();
+            double pageRank  = pageRankScores.getOrDefault(docId, 1.0);
+            // getOrDefault(key, default): returns 1.0 if this doc has no PageRank score yet.
+            double finalScore = tfidf * pageRank;
+            // FINAL RANKING FORMULA: TF-IDF Ã— PageRank
+            // High TF-IDF: the query terms appear frequently and prominently in this doc.
+            // High PageRank: many important pages link to this doc â†’ authoritative.
+            // Both factors together = likely a relevant AND authoritative result.
+
+            Optional<Document> doc = invertedIndex.getDocument(docId);
+            String snippet = doc.map(d -> generateSnippet(d.body(), terms))
+                    // Optional.map(function): if present, apply function; return Optional of result.
+                    // Returns Optional<String>. If doc is empty â†’ Optional.empty().
+                    .orElse("No snippet available.");
+                    // orElse: default value if Optional is empty.
+            String title = doc.map(Document::title).orElse(docId);
+
+            topKHeap.offer(new SearchResult(docId, title, snippet, finalScore, Instant.now()));
+        }
+
+        // Extract results from the heap in order (highest score first):
+        List<SearchResult> results = new ArrayList<>();
+        while (!topKHeap.isEmpty()) {
+            results.add(topKHeap.poll());
+            // poll(): removes and returns the head (highest score since we used reversed comparator).
+        }
+        // The heap naturally orders results by score (highest first due to compareTo implementation).
+        return results;
+    }
+
+    /**
+     * Generate a snippet: find the first occurrence of any query term in the body,
+     * return the surrounding ~150 characters as context.
+     */
+    private String generateSnippet(String body, List<String> terms) {
+        if (body == null) return "";
+        String lower = body.toLowerCase();
+        // Find the earliest position of any query term in the body
+        int pos = terms.stream()
+                .mapToInt(t -> lower.indexOf(t))
+                // mapToInt: transform String â†’ int (index of term in body). Returns IntStream.
+                // String.indexOf(str): returns the index of first occurrence, or -1 if not found.
+                .filter(i -> i >= 0)
+                // filter: remove -1 values (terms not found in body)
+                .min()
+                // IntStream.min(): returns OptionalInt (minimum value, or empty if no elements).
+                .orElse(0);
+                // orElse(0): if no term found, start snippet at beginning of body.
+
+        int start = Math.max(0, pos - 30);
+        // Show 30 chars before the matched term for context.
+        // Math.max(0, ...): don't go before the start of the string.
+        int end   = Math.min(body.length(), start + 150);
+        // Show 150 chars total. Math.min: don't go past the end of the string.
+        return (start > 0 ? "..." : "") + body.substring(start, end) + (end < body.length() ? "..." : "");
+        // Add "..." prefix if we didn't start at the beginning (shows context was truncated).
+        // Ternary operator: condition ? valueIfTrue : valueIfFalse.
+    }
+
+    /** Add a URL to the crawl frontier. */
+    public boolean addToCrawlQueue(String url, CrawlPriority priority) {
+        int p = switch (priority) {
+            // Java 14+ switch expression (value-producing switch â€” replaces switch statement).
+            // Each case produces a value directly (no break needed).
+            case HIGH   -> 1;
+            case MEDIUM -> 5;
+            case LOW    -> 10;
+        };
+        return frontier.add(url, p, 0);  // depth=0 for seed URLs
+    }
+
+    /** Update PageRank score for a document (called by PageRank batch job). */
+    public void updatePageRank(String docId, double score) {
+        pageRankScores.put(docId, score);
+        // ConcurrentHashMap.put() is thread-safe. No additional lock needed.
+    }
+
+    /** Get all pending URLs for the crawler (batch fetch for crawler workers). */
+    public List<CrawlUrl> getNextBatch(int batchSize) {
+        List<CrawlUrl> batch = new ArrayList<>(batchSize);
+        for (int i = 0; i < batchSize && !frontier.isEmpty(); i++) {
+            CrawlUrl next = frontier.poll();
+            if (next != null) batch.add(next);
+        }
+        return batch;
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// PAGERANK CALCULATOR  (simplified iterative computation)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class PageRankCalculator {
+    private static final double DAMPING    = 0.85;  // Standard PageRank damping factor
+    private static final double CONVERGENCE = 0.001; // Stop when change < 0.1%
+    // DAMPING FACTOR (d = 0.85):
+    //   Models the probability that a random web surfer follows a link (85%)
+    //   vs teleports to a random page (15%). Prevents rank sink (dangling nodes).
+    //   PR(page) = (1 - d) + d Ã— Î£ (PR(linking_page) / out_degree(linking_page))
+
+    /**
+     * Compute PageRank iteratively until convergence.
+     * @param adjacency: outbound links. Key: sourceUrl, Value: list of target URLs.
+     * @return Map of docId â†’ PageRank score.
+     */
+    public Map<String, Double> compute(Map<String, List<String>> adjacency, int maxIterations) {
+        Set<String> allNodes = new HashSet<>(adjacency.keySet());
+        // Add all target nodes (some pages are linked-to but don't have outbound links):
+        adjacency.values().forEach(links -> allNodes.addAll(links));
+        // Set.addAll(): adds all elements from collection. Duplicates are ignored (Set semantics).
+
+        int n = allNodes.size();
+        if (n == 0) return Map.of();  // Map.of(): immutable empty map (Java 9+)
+
+        // Initialize: all pages start with equal PageRank = 1/N
+        Map<String, Double> ranks = new HashMap<>();
+        allNodes.forEach(node -> ranks.put(node, 1.0 / n));
+        // Map.forEach(BiConsumer): iterates all (key, value) pairs. Lambda receives (node, initialRank).
+
+        for (int iteration = 0; iteration < maxIterations; iteration++) {
+            Map<String, Double> newRanks = new HashMap<>();
+
+            // Initialize all nodes with the teleport component (1 - d) / N
+            allNodes.forEach(node -> newRanks.put(node, (1.0 - DAMPING) / n));
+
+            // Distribute rank from each node to its outbound links
+            for (Map.Entry<String, List<String>> entry : adjacency.entrySet()) {
+                String       source = entry.getKey();
+                List<String> links  = entry.getValue();
+                if (links.isEmpty()) continue;  // Dangling node: no outbound links (skip)
+
+                double rankShare = DAMPING * ranks.get(source) / links.size();
+                // This node's rank is split equally among its outbound links.
+                // DAMPING Ã— PR(source) / out_degree(source)
+
+                for (String target : links) {
+                    if (allNodes.contains(target)) {
+                        // merge(key, delta, mergeFunction): atomically add delta to existing value.
+                        // merge(k, v, f): if key absent â†’ put(k, v); if present â†’ put(k, f(old, v)).
+                        // Here: f = Double::sum â†’ newRanks[target] += rankShare
+                        newRanks.merge(target, rankShare, Double::sum);
+                        // Double::sum is a method reference for the BinaryOperator (a, b) -> a + b.
+                        // Cleaner than: newRanks.put(target, newRanks.getOrDefault(target, 0.0) + rankShare)
+                    }
+                }
+            }
+
+            // Check convergence: if max change in any node's rank < threshold â†’ stop
+            double maxDelta = allNodes.stream()
+                    .mapToDouble(node -> Math.abs(newRanks.getOrDefault(node, 0.0)
+                                                 - ranks.getOrDefault(node, 0.0)))
+                    // mapToDouble: extract double values (absolute rank change per node).
+                    .max()
+                    // DoubleStream.max(): returns OptionalDouble (max value across all nodes).
+                    .orElse(0.0);
+                    // orElse: if stream was empty (no nodes) â†’ delta = 0.
+
+            ranks.putAll(newRanks);
+            // Map.putAll(): copies all (key, value) from newRanks into ranks. Overwrites existing keys.
+
+            if (maxDelta < CONVERGENCE) {
+                System.out.printf("PageRank converged after %d iterations%n", iteration + 1);
+                break;  // Early exit when converged. Typical: 50-100 iterations for real web graphs.
+            }
+        }
+
+        return Collections.unmodifiableMap(ranks);
+        // Return immutable view: caller can read but cannot modify the ranks map.
+    }
+}
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// DEMO
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class GoogleSearchJavaDemo {
+    public static void main(String[] args) {
+        SearchEngine engine = new SearchEngine();
+
+        // â”€â”€ Seed the crawler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        engine.addToCrawlQueue("https://docs.oracle.com/javase/tutorial/", CrawlPriority.HIGH);
+        engine.addToCrawlQueue("https://www.baeldung.com/java-design-patterns", CrawlPriority.HIGH);
+        engine.addToCrawlQueue("https://refactoring.guru/design-patterns", CrawlPriority.MEDIUM);
+
+        // â”€â”€ Simulate crawled documents â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        Document doc1 = new Document(
+            "https://docs.oracle.com/javase/tutorial/",
+            "Java Tutorials â€” Oracle",
+            "Java is an object-oriented programming language. " +
+            "Java design patterns like singleton factory observer strategy " +
+            "are essential for software engineering. Java concurrent programming " +
+            "uses locks and atomic operations for thread safety.",
+            List.of("https://docs.oracle.com/javase/8/docs/api/"),
+            1.0, Instant.now()
+        );
+        Document doc2 = new Document(
+            "https://www.baeldung.com/java-design-patterns",
+            "Java Design Patterns â€” Baeldung",
+            "Design patterns are reusable solutions to common software design problems. " +
+            "The singleton pattern ensures only one instance of a class exists in Java. " +
+            "Observer pattern enables event-driven programming in Java applications. " +
+            "Strategy pattern allows swapping algorithms at runtime.",
+            List.of("https://refactoring.guru/design-patterns"),
+            0.8, Instant.now()
+        );
+        Document doc3 = new Document(
+            "https://refactoring.guru/design-patterns",
+            "Design Patterns â€” Refactoring Guru",
+            "Catalog of design patterns in software engineering. " +
+            "Creational patterns: factory method, abstract factory, singleton, builder, prototype. " +
+            "Structural: adapter, decorator, proxy, composite. " +
+            "Behavioral: observer, strategy, command, template method, iterator.",
+            List.of(),
+            1.2, Instant.now()
+        );
+
+        engine.indexDocument(doc1);
+        engine.indexDocument(doc2);
+        engine.indexDocument(doc3);
+
+        // â”€â”€ Update PageRank scores (normally from batch job) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        engine.updatePageRank(doc1.id(), 1.5);   // High authority (Oracle)
+        engine.updatePageRank(doc2.id(), 1.0);   // Good authority (Baeldung)
+        engine.updatePageRank(doc3.id(), 1.3);   // Good authority (Refactoring Guru)
+
+        // â”€â”€ Standalone PageRank computation demo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        PageRankCalculator prCalc = new PageRankCalculator();
+        Map<String, List<String>> adjacency = Map.of(
+            doc1.id(), doc1.outboundLinks(),
+            doc2.id(), doc2.outboundLinks(),
+            doc3.id(), doc3.outboundLinks()
+        );
+        // Map.of(k1, v1, k2, v2, ...): immutable map factory (Java 9+). Up to 10 entries.
+        Map<String, Double> pageRanks = prCalc.compute(adjacency, 100);
+        System.out.println("\n--- Computed PageRanks ---");
+        pageRanks.forEach((url, score) ->
+            System.out.printf("  %.2f  %s%n", score,
+                              url.substring(0, Math.min(50, url.length()))));
+        // Map.forEach: iterates all (key, value) pairs. Printf formats: %.2f = 2 decimal places.
+
+        // â”€â”€ Search queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        System.out.println("\n--- Search: 'java design patterns' ---");
+        List<SearchResult> results = engine.search("java design patterns", 5);
+        results.forEach(r -> System.out.printf(
+            "  Score=%.3f  %s%n    %s%n%n",
+            r.score(), r.title(), r.snippet().substring(0, Math.min(80, r.snippet().length()))
+        ));
+
+        System.out.println("--- Search: 'singleton observer java' ---");
+        engine.search("singleton observer java", 3)
+              .forEach(r -> System.out.printf("  [%.3f] %s%n", r.score(), r.title()));
+
+        System.out.println("\n--- Crawl Queue ---");
+        List<CrawlUrl> batch = engine.getNextBatch(5);
+        batch.forEach(cu -> System.out.printf("  Priority=%d: %s%n", cu.priority(), cu.url()));
+    }
+}
+```
+
+---
